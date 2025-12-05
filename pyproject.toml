@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ignacio"
+version = "0.1.0"
+description = "Open-source fire growth simulation system based on the Canadian FBP System"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Fire Engine Framework Contributors"}
+]
+keywords = [
+    "fire", "wildfire", "simulation", "FBP", "CFFDRS", 
+    "fire behavior", "fire spread", "PROMETHEUS"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "geopandas>=0.14.0",
+    "rasterio>=1.3.0",
+    "shapely>=2.0.0",
+    "scipy>=1.11.0",
+    "matplotlib>=3.7.0",
+    "pyyaml>=6.0",
+    "click>=8.1.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+ignacio = "ignacio.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/fire-engine-framework/ignacio"
+Documentation = "https://github.com/fire-engine-framework/ignacio#readme"
+Repository = "https://github.com/fire-engine-framework/ignacio"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ignacio*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
