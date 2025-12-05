@@ -1,0 +1,13 @@
+<PAMDataset>
+  <PAMRasterBand band="1">
+    <Description>Canadian FBP Fuel Types, 30m, May 22nd, 2024</Description>
+    <Metadata>
+      <MDI key="STATISTICS_APPROXIMATE">YES</MDI>
+      <MDI key="STATISTICS_MAXIMUM">675</MDI>
+      <MDI key="STATISTICS_MEAN">82.28212094946</MDI>
+      <MDI key="STATISTICS_MINIMUM">2</MDI>
+      <MDI key="STATISTICS_STDDEV">139.64382802285</MDI>
+      <MDI key="STATISTICS_VALID_PERCENT">61.47</MDI>
+    </Metadata>
+  </PAMRasterBand>
+</PAMDataset>
