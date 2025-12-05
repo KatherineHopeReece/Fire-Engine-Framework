@@ -93,6 +93,12 @@ python run_ignacio.py
 python run_ignacio.py --config my_config.yaml
 ```
 
+Or using the pip CLI
+
+```bash
+ignacio run my_config.yaml
+```
+
 ### 4. View Results
 
 Output files are written to the `output/` directory:
