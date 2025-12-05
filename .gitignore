@@ -1,3 +1,4 @@
 ignacio.egg-info/
 output/
 .DS_store
+data/*/*
