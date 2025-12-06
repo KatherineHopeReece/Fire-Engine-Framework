@@ -162,7 +162,7 @@ def fetch_landcover(bbox):
 
 
 # ==============================================================================
-# 3. META CANOPY HEIGHT (FIXED: Proper array handling)
+# 3. META CANOPY HEIGHT (FIXED: Proper CRS handling)
 # ==============================================================================
 def fetch_canopy_height(bbox):
     print("\n3. Fetching Meta Canopy Height...")
@@ -203,7 +203,7 @@ def fetch_canopy_height(bbox):
 
     print(f"   Found {len(target_files)} tiles to process...")
 
-    # 3. Download all tiles first, then process
+    # 3. Download all tiles first
     temp_files = []
     for fname in target_files:
         key = prefix + "chm/" + fname
@@ -221,31 +221,56 @@ def fetch_canopy_height(bbox):
         print("   [ERROR] No tiles downloaded.")
         return
 
-    # 4. FIX: Load, clip, and collect arrays properly
+    # 4. FIX: Handle CRS properly - reproject bbox to tile CRS
     clipped_arrays = []
+    target_crs = None
+    
     for local_tif in temp_files:
         try:
-            # Load data into memory before closing file handle
             ds = rioxarray.open_rasterio(local_tif)
-            ds.rio.write_crs("EPSG:4326", inplace=True)
-
-            # Check if tile actually overlaps bbox in raster space
+            tile_crs = ds.rio.crs
+            
+            if tile_crs is None:
+                print(f"   [WARN] {local_tif.name} has no CRS, assuming EPSG:4326")
+                ds.rio.write_crs("EPSG:4326", inplace=True)
+                tile_crs = ds.rio.crs
+            
+            # Store target CRS from first valid tile
+            if target_crs is None:
+                target_crs = tile_crs
+                print(f"   Tile CRS: {tile_crs}")
+            
+            # Create bbox geometry and transform to tile CRS
+            bbox_gdf = gpd.GeoDataFrame(
+                geometry=[box(*bbox)], 
+                crs="EPSG:4326"
+            ).to_crs(tile_crs)
+            transformed_bbox = bbox_gdf.total_bounds  # [minx, miny, maxx, maxy]
+            
+            # Check if tile overlaps transformed bbox
             tile_bounds = ds.rio.bounds()
-            if (tile_bounds[2] < bbox[0] or tile_bounds[0] > bbox[2] or
-                tile_bounds[3] < bbox[1] or tile_bounds[1] > bbox[3]):
+            if (tile_bounds[2] < transformed_bbox[0] or 
+                tile_bounds[0] > transformed_bbox[2] or
+                tile_bounds[3] < transformed_bbox[1] or 
+                tile_bounds[1] > transformed_bbox[3]):
                 ds.close()
                 continue
 
-            # Clip and load into memory
-            ds_clipped = ds.rio.clip_box(*bbox)
-            ds_loaded = ds_clipped.load()  # FIX: Load data into memory
-            clipped_arrays.append(ds_loaded)
+            # Clip using transformed bbox
+            try:
+                ds_clipped = ds.rio.clip_box(*transformed_bbox)
+                ds_loaded = ds_clipped.load()
+                clipped_arrays.append(ds_loaded)
+                print(f"   Clipped {local_tif.name}: {ds_loaded.shape}")
+            except Exception as clip_err:
+                print(f"   [WARN] Clip failed for {local_tif.name}: {clip_err}")
+            
             ds.close()
 
         except Exception as e:
             print(f"   [WARN] Could not process {local_tif.name}: {e}")
 
-    # 5. Merge
+    # 5. Merge and reproject to EPSG:4326
     if clipped_arrays:
         try:
             print(f"   Merging {len(clipped_arrays)} clipped tiles...")
@@ -254,11 +279,19 @@ def fetch_canopy_height(bbox):
             else:
                 chm_merged = clipped_arrays[0]
 
-            chm_merged.rio.to_raster(final_path, compress='LZW')
+            # Reproject to EPSG:4326 for consistency with other outputs
+            print("   Reprojecting to EPSG:4326...")
+            chm_reprojected = chm_merged.rio.reproject("EPSG:4326")
+            
+            # Final clip to exact bbox
+            chm_final = chm_reprojected.rio.clip_box(*bbox)
+            chm_final.rio.to_raster(final_path, compress='LZW')
             print(f"   [SUCCESS] Saved: {final_path}")
 
         except Exception as e:
-            print(f"   [ERROR] Merge failed: {e}")
+            print(f"   [ERROR] Merge/reproject failed: {e}")
+            import traceback
+            traceback.print_exc()
     else:
         print("   [ERROR] No valid data extracted from tiles.")
 
@@ -583,7 +616,8 @@ def fetch_burned_area(bbox):
         resp = requests.get(base_url, timeout=30)
         resp.raise_for_status()
 
-        match = re.search(r'href="(nbac_2020_[^"]+\.zip)"', resp.text)
+        # FIX: Updated regex - files now named NBAC_YYYY_YYYYMMDD.zip (uppercase)
+        match = re.search(r'href="(NBAC_2020_[^"]+\.zip)"', resp.text, re.IGNORECASE)
 
         if not match:
             print("   [ERROR] Could not find 2020 NBAC zip file in listing.")
