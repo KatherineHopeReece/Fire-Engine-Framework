@@ -201,6 +201,52 @@ class MarkerMethodConfig(BaseModel):
     epsilon: float = Field(1.0, gt=0)  # meters - offset for marker method
 
 
+class CalibrationConfig(BaseModel):
+    """
+    JAX-based calibration configuration.
+    
+    When enabled, uses differentiable JAX implementation for fire spread
+    calculations and gradient-based parameter optimization.
+    """
+    
+    enabled: bool = Field(False, description="Enable JAX-based calibration mode")
+    use_jax_simulation: bool = Field(False, description="Use JAX for simulation (faster, GPU-capable)")
+    
+    # Parameters to calibrate
+    calibrate_wind: bool = Field(True, description="Calibrate wind adjustment factor")
+    calibrate_ffmc: bool = Field(True, description="Calibrate FFMC adjustment")
+    calibrate_ros_scale: bool = Field(False, description="Calibrate overall ROS scaling")
+    calibrate_backing: bool = Field(False, description="Calibrate backing fraction")
+    
+    # Initial values
+    wind_adj_init: float = Field(1.0, gt=0, description="Initial wind adjustment factor")
+    ffmc_adj_init: float = Field(0.0, description="Initial FFMC adjustment")
+    ros_scale_init: float = Field(1.0, gt=0, description="Initial ROS scale factor")
+    backing_frac_init: float = Field(0.2, gt=0, lt=1, description="Initial backing fraction")
+    
+    # Calibrated values (populated after calibration)
+    wind_adj: float = Field(1.0, gt=0, description="Calibrated wind adjustment factor")
+    ffmc_adj: float = Field(0.0, description="Calibrated FFMC adjustment")
+    ros_scale: float = Field(1.0, gt=0, description="Calibrated ROS scale factor")
+    backing_frac: float = Field(0.2, gt=0, lt=1, description="Calibrated backing fraction")
+    
+    # Optimization settings
+    learning_rate: float = Field(0.1, gt=0, description="Optimizer learning rate")
+    n_iterations: int = Field(100, ge=1, description="Maximum calibration iterations")
+    convergence_tol: float = Field(1e-6, gt=0, description="Convergence tolerance")
+    regularization: float = Field(0.01, ge=0, description="L2 regularization strength")
+    
+    # Parameter bounds
+    wind_adj_bounds: tuple[float, float] = Field((0.3, 3.0), description="Wind adjustment bounds")
+    ffmc_adj_bounds: tuple[float, float] = Field((-15.0, 15.0), description="FFMC adjustment bounds")
+    ros_scale_bounds: tuple[float, float] = Field((0.3, 3.0), description="ROS scale bounds")
+    backing_frac_bounds: tuple[float, float] = Field((0.05, 0.5), description="Backing fraction bounds")
+    
+    # Observation data for calibration
+    observed_areas: list[float] = Field(default_factory=list, description="Observed fire areas (m²)")
+    observed_durations: list[float] = Field(default_factory=list, description="Fire durations (minutes)")
+
+
 class SimulationConfig(BaseModel):
     """Simulation parameters configuration."""
     
@@ -246,6 +292,7 @@ class IgnacioConfig(BaseModel):
     weather: WeatherConfig
     fbp: FBPConfig = Field(default_factory=FBPConfig)
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
+    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     
     @field_validator("project", mode="before")
