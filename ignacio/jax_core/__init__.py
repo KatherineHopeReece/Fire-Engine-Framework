@@ -254,6 +254,77 @@ from .levelset_enhanced import (
     quick_simulate,
 )
 
+# Eruptive fire behavior (canyon effect, blowup)
+from .eruptive_fire import (
+    EruptiveParams,
+    EruptiveState,
+    EruptiveResult,
+    compute_flame_tilt_angle,
+    compute_attachment_probability,
+    compute_eruptive_potential,
+    detect_canyon_geometry,
+    compute_ros_multiplier,
+    initialize_eruptive_state,
+    update_eruptive_state,
+    compute_eruptive_ros,
+    classify_eruptive_danger,
+    summarize_eruptive_risk,
+)
+
+# Dynamic phenology (live fuel moisture, curing)
+from .dynamic_phenology import (
+    PhenologyParams,
+    PhenologyState,
+    PhenologyResult,
+    compute_aspect_modifier,
+    compute_elevation_delay,
+    compute_seasonal_greenness,
+    greenness_to_curing,
+    greenness_to_lfm,
+    compute_ffmc_modifier,
+    integrate_ndvi,
+    initialize_phenology_state,
+    update_phenology_state,
+    compute_phenology_effects,
+    apply_curing_to_grass_fuels,
+    apply_lfm_to_conifer_fuels,
+    estimate_phenology_from_climate,
+    summarize_phenology,
+)
+
+# Smoke transport (advection-diffusion)
+from .smoke_transport import (
+    SmokeParams,
+    SmokeState,
+    SmokeResult,
+    compute_emission_source,
+    compute_effective_diffusion,
+    advection_step,
+    diffusion_step,
+    apply_decay,
+    concentration_to_pm25,
+    compute_visibility,
+    compute_aqi_category,
+    initialize_smoke_state,
+    compute_stable_timestep,
+    update_smoke_state,
+    compute_smoke_impacts,
+    compute_plume_centerline,
+    compute_plume_width,
+    summarize_smoke_impacts,
+)
+
+# Fully-integrated simulation
+from .simulation_full import (
+    FullSimConfig,
+    FullSimState,
+    FullSimResult,
+    initialize_full_simulation,
+    evolve_full_step,
+    run_full_simulation,
+    quick_full_simulation,
+)
+
 
 __all__ = [
     # New core (recommended)
@@ -420,4 +491,63 @@ __all__ = [
     "create_enhanced_grids",
     "simulate_fire_enhanced",
     "quick_simulate",
+    # Eruptive fire behavior (canyon effect)
+    "EruptiveParams",
+    "EruptiveState",
+    "EruptiveResult",
+    "compute_flame_tilt_angle",
+    "compute_attachment_probability",
+    "compute_eruptive_potential",
+    "detect_canyon_geometry",
+    "compute_ros_multiplier",
+    "initialize_eruptive_state",
+    "update_eruptive_state",
+    "compute_eruptive_ros",
+    "classify_eruptive_danger",
+    "summarize_eruptive_risk",
+    # Dynamic phenology (live fuel curing)
+    "PhenologyParams",
+    "PhenologyState",
+    "PhenologyResult",
+    "compute_aspect_modifier",
+    "compute_elevation_delay",
+    "compute_seasonal_greenness",
+    "greenness_to_curing",
+    "greenness_to_lfm",
+    "compute_ffmc_modifier",
+    "integrate_ndvi",
+    "initialize_phenology_state",
+    "update_phenology_state",
+    "compute_phenology_effects",
+    "apply_curing_to_grass_fuels",
+    "apply_lfm_to_conifer_fuels",
+    "estimate_phenology_from_climate",
+    "summarize_phenology",
+    # Smoke transport (advection-diffusion)
+    "SmokeParams",
+    "SmokeState",
+    "SmokeResult",
+    "compute_emission_source",
+    "compute_effective_diffusion",
+    "advection_step",
+    "diffusion_step",
+    "apply_decay",
+    "concentration_to_pm25",
+    "compute_visibility",
+    "compute_aqi_category",
+    "initialize_smoke_state",
+    "compute_stable_timestep",
+    "update_smoke_state",
+    "compute_smoke_impacts",
+    "compute_plume_centerline",
+    "compute_plume_width",
+    "summarize_smoke_impacts",
+    # Fully-integrated simulation
+    "FullSimConfig",
+    "FullSimState",
+    "FullSimResult",
+    "initialize_full_simulation",
+    "evolve_full_step",
+    "run_full_simulation",
+    "quick_full_simulation",
 ]
