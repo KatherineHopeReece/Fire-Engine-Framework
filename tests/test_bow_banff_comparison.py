@@ -1,588 +1,726 @@
 #!/usr/bin/env python3
 """
-Bow at Banff - NumPy vs JAX Comparison Test.
+Bow Valley at Banff Comparison Study.
 
-Runs the full Ignacio simulation and compares JAX results on the same grids.
+This script compares multiple model configurations for the Bow Valley region,
+simulating fire spread under various physics options and creating visualizations
+including animated GIFs.
+
+The 2014-03-08 fire event is used as a reference case.
+
+Usage:
+    python test_bow_banff_comparison.py
 """
 
-import sys
-import logging
-import time
-from pathlib import Path
-
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+from pathlib import Path
+from datetime import datetime, timedelta
+import time
+import sys
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+# Add parent to path if needed
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-
-def main():
-    """Run comparison test."""
-    logger.info("=" * 70)
-    logger.info("IGNACIO: Bow at Banff - NumPy vs JAX Comparison")
-    logger.info("=" * 70)
-    
-    # Check JAX
-    try:
-        import jax
-        import jax.numpy as jnp
-        jax.config.update("jax_enable_x64", True)
-        logger.info(f"JAX version: {jax.__version__}")
-    except ImportError as e:
-        logger.error(f"JAX not available: {e}")
-        return 1
-    
-    from ignacio.config import load_config
-    from ignacio.terrain import build_terrain_grids
-    from ignacio.simulation import build_parameter_grid
-    from ignacio.weather import process_fire_weather, load_weather_data
-    from ignacio.ignition import generate_ignitions
-    from ignacio.io import read_raster_int
-    from ignacio.spread import simulate_fire_spread
-    
-    # Import JAX core
-    jax_core_path = str(project_root / "ignacio" / "jax_core")
-    sys.path.insert(0, jax_core_path)
-    from core import FireGrids, simulate_fire, compute_area
-    from levelset import (
-        LevelSetGrids, 
-        simulate_fire_levelset_with_area,
-        compute_burned_area_hard,
-    )
-    
-    # =================================================================
-    # Load config and build grids (same as full Ignacio simulation)
-    # =================================================================
-    config_path = project_root / "ignacio.yaml"
-    config = load_config(config_path)
-    rng = np.random.default_rng(config.project.random_seed)
-    
-    logger.info(f"\nBuilding grids...")
-    terrain = build_terrain_grids(config)
-    
-    hourly_data = None
-    if config.simulation.time_varying_weather:
-        hourly_data = load_weather_data(config)
-        logger.info(f"Loaded {len(hourly_data)} hourly weather records")
-    
-    weather = process_fire_weather(config, rng)
-    
-    param_grid = build_parameter_grid(config, terrain, weather, hourly_data=hourly_data)
-    logger.info(f"Grid shape: {param_grid.ros.shape}")
-    logger.info(f"ROS range: {param_grid.ros.min():.2f} - {param_grid.ros.max():.2f} m/min")
-    
-    # Get ignition
-    fuel_raster = read_raster_int(config.fuel.path)
-    terrain_crs = str(terrain.crs) if terrain.crs else None
-    ignitions = generate_ignitions(config, fuel_raster, rng, terrain_crs=terrain_crs)
-    ign = ignitions.points[0]
-    x_ign, y_ign = ign.x, ign.y
-    logger.info(f"Ignition: ({x_ign:.6f}, {y_ign:.6f})")
-    
-    # Simulation params
-    dt = config.simulation.dt
-    n_vertices = config.simulation.n_vertices
-    initial_radius = config.simulation.initial_radius
-    n_steps = int(config.simulation.max_duration / dt)
-    
-    # Geographic handling
-    is_geographic = False
-    center_latitude = None
-    meters_per_deg_lat = 111320.0
-    meters_per_deg_lon = 111320.0
-    avg_meters_per_deg = 111320.0
-    
-    if terrain.crs is not None:
-        from pyproj import CRS
-        crs = CRS.from_user_input(terrain.crs)
-        is_geographic = crs.is_geographic
-        if is_geographic:
-            center_latitude = (param_grid.y_min + param_grid.y_max) / 2
-            lat_rad = np.radians(center_latitude)
-            meters_per_deg_lon = 111320.0 * np.cos(lat_rad)
-            avg_meters_per_deg = (meters_per_deg_lat + meters_per_deg_lon) / 2.0
-            logger.info(f"Geographic CRS, center lat: {center_latitude:.4f}°")
-    
-    # =================================================================
-    # NumPy Simulation
-    # =================================================================
-    logger.info(f"\n{'='*60}")
-    logger.info("NumPy Simulation")
-    logger.info(f"{'='*60}")
-    
-    start_time = time.time()
-    numpy_history = simulate_fire_spread(
-        param_grid=param_grid,
-        x_ignition=x_ign,
-        y_ignition=y_ign,
-        dt=dt,
-        n_vertices=n_vertices,
-        initial_radius=initial_radius,
-        max_steps=n_steps,
-        is_geographic=is_geographic,
-        center_latitude=center_latitude,
-    )
-    numpy_time = time.time() - start_time
-    
-    numpy_x, numpy_y = numpy_history.get_final_perimeter()
-    
-    # Compute area properly for geographic coordinates
-    if is_geographic:
-        # Convert perimeter to meters for area calculation
-        x_m = (numpy_x - x_ign) * meters_per_deg_lon
-        y_m = (numpy_y - y_ign) * meters_per_deg_lat
-        numpy_area = 0.5 * np.abs(np.sum(x_m * np.roll(y_m, -1) - np.roll(x_m, -1) * y_m))
-    else:
-        numpy_area = 0.5 * np.abs(np.sum(numpy_x * np.roll(numpy_y, -1) - np.roll(numpy_x, -1) * numpy_y))
-    
-    logger.info(f"NumPy area: {numpy_area:.0f} m² ({numpy_area/10000:.2f} ha)")
-    logger.info(f"NumPy time: {numpy_time:.2f} seconds")
-    
-    # =================================================================
-    # JAX Simulation (same grids, converted for geographic)
-    # =================================================================
-    logger.info(f"\n{'='*60}")
-    logger.info("JAX Simulation")
-    logger.info(f"{'='*60}")
-    
-    # Convert grids for JAX
-    if is_geographic:
-        # Convert ROS from m/min to deg/min
-        ros_jax = param_grid.ros / avg_meters_per_deg
-        bros_jax = param_grid.bros / avg_meters_per_deg
-        fros_jax = param_grid.fros / avg_meters_per_deg
-        jax_initial_radius = initial_radius / avg_meters_per_deg
-    else:
-        ros_jax = param_grid.ros
-        bros_jax = param_grid.bros
-        fros_jax = param_grid.fros
-        jax_initial_radius = initial_radius
-    
-    jax_grids = FireGrids(
-        x_coords=jnp.array(param_grid.x_coords),
-        y_coords=jnp.array(param_grid.y_coords),
-        ros=jnp.array(ros_jax),
-        bros=jnp.array(bros_jax),
-        fros=jnp.array(fros_jax),
-        raz=jnp.array(param_grid.raz),
-    )
-    
-    # First run (JIT compile)
-    start_time = time.time()
-    jax_x, jax_y = simulate_fire(
-        jax_grids, x_ign, y_ign,
-        n_steps=n_steps,
-        dt=dt,
-        n_vertices=n_vertices,
-        initial_radius=jax_initial_radius,
-    )
-    jax_jit_time = time.time() - start_time
-    
-    # Second run (cached)
-    start_time = time.time()
-    jax_x, jax_y = simulate_fire(
-        jax_grids, x_ign, y_ign,
-        n_steps=n_steps,
-        dt=dt,
-        n_vertices=n_vertices,
-        initial_radius=jax_initial_radius,
-    )
-    jax_cached_time = time.time() - start_time
-    
-    # Compute JAX area
-    jax_x_np = np.array(jax_x)
-    jax_y_np = np.array(jax_y)
-    
-    if is_geographic:
-        # Convert perimeter to meters for area calculation
-        x_m = (jax_x_np - x_ign) * meters_per_deg_lon
-        y_m = (jax_y_np - y_ign) * meters_per_deg_lat
-        jax_area = 0.5 * np.abs(np.sum(x_m * np.roll(y_m, -1) - np.roll(x_m, -1) * y_m))
-    else:
-        jax_area = float(compute_area(jax_x, jax_y))
-    
-    logger.info(f"JAX perimeter area: {jax_area:.0f} m² ({jax_area/10000:.2f} ha)")
-    logger.info(f"JAX perimeter time (JIT): {jax_jit_time:.2f}s, (cached): {jax_cached_time:.2f}s")
-    
-    # Compare perimeter extents
-    logger.info(f"\nPerimeter extents:")
-    numpy_extent_x = (np.max(numpy_x) - np.min(numpy_x)) * meters_per_deg_lon
-    numpy_extent_y = (np.max(numpy_y) - np.min(numpy_y)) * meters_per_deg_lat
-    jax_extent_x = (np.max(jax_x_np) - np.min(jax_x_np)) * meters_per_deg_lon
-    jax_extent_y = (np.max(jax_y_np) - np.min(jax_y_np)) * meters_per_deg_lat
-    logger.info(f"  NumPy: {numpy_extent_x:.0f}m x {numpy_extent_y:.0f}m")
-    logger.info(f"  JAX perimeter: {jax_extent_x:.0f}m x {jax_extent_y:.0f}m (note: self-intersecting)")
-    
-    # Bounding box areas for sanity check
-    numpy_bbox_area = numpy_extent_x * numpy_extent_y
-    jax_bbox_area = jax_extent_x * jax_extent_y
-    logger.info(f"  NumPy bbox: {numpy_bbox_area/10000:.2f} ha, computed: {numpy_area/10000:.2f} ha ✓")
-    logger.info(f"  JAX bbox: {jax_bbox_area/10000:.2f} ha, computed: {jax_area/10000:.2f} ha (impossible - polygon self-intersects)")
-    
-    # =================================================================
-    # Level-Set Simulation (robust topology handling)
-    # =================================================================
-    logger.info(f"\n{'='*60}")
-    logger.info("JAX Level-Set Simulation")
-    logger.info(f"{'='*60}")
-    
-    # Create level-set grids
-    ls_grids = LevelSetGrids(
-        x_coords=jnp.array(param_grid.x_coords),
-        y_coords=jnp.array(param_grid.y_coords),
-        ros=jnp.array(ros_jax),
-        bros=jnp.array(bros_jax),
-        fros=jnp.array(fros_jax),
-        raz=jnp.array(param_grid.raz),
-    )
-    
-    # Grid spacing calculations
-    dx_ls = abs(float(ls_grids.x_coords[1] - ls_grids.x_coords[0]))
-    dy_ls = abs(float(ls_grids.y_coords[1] - ls_grids.y_coords[0]))
-    min_radius = np.sqrt(dx_ls**2 + dy_ls**2)
-    effective_radius = max(jax_initial_radius, min_radius)
-    ros_grid = np.array(ls_grids.ros)
-    
-    # Debug: Check grid setup
-    logger.info(f"Level-set grid:")
-    logger.info(f"  Grid: {len(ls_grids.x_coords)}x{len(ls_grids.y_coords)} cells")
-    logger.info(f"  Cell size: {dx_ls*meters_per_deg_lon:.1f}m x {abs(dy_ls)*meters_per_deg_lat:.1f}m")
-    logger.info(f"  Effective radius: {effective_radius * avg_meters_per_deg:.1f}m (auto-adjusted from {jax_initial_radius * avg_meters_per_deg:.1f}m)")
-    logger.info(f"  ROS range: [{ros_grid.min()*avg_meters_per_deg:.2f}, {ros_grid.max()*avg_meters_per_deg:.2f}] m/min")
-    
-    # Run level-set simulation (elliptical)
-    start_time = time.time()
-    phi, ls_area = simulate_fire_levelset_with_area(
-        ls_grids, x_ign, y_ign,
-        n_steps=n_steps,
-        dt=dt,
-        initial_radius=jax_initial_radius,
-        differentiable=False,
-        use_ellipse=True,
-    )
-    ls_time = time.time() - start_time
-    
-    # Run isotropic for comparison
-    phi_iso, iso_area = simulate_fire_levelset_with_area(
-        ls_grids, x_ign, y_ign,
-        n_steps=n_steps,
-        dt=dt,
-        initial_radius=jax_initial_radius,
-        differentiable=False,
-        use_ellipse=False,
-    )
-    
-    # Convert areas to m²
-    if is_geographic:
-        ls_area_m2 = float(ls_area) * meters_per_deg_lon * meters_per_deg_lat
-        iso_area_m2 = float(iso_area) * meters_per_deg_lon * meters_per_deg_lat
-    else:
-        ls_area_m2 = float(ls_area)
-        iso_area_m2 = float(iso_area)
-    
-    burned_cells = np.sum(np.array(phi) < 0)
-    logger.info(f"Level-set (elliptical): {ls_area_m2/10000:.2f} ha ({burned_cells} cells, {ls_time:.2f}s)")
-    logger.info(f"Level-set (isotropic):  {iso_area_m2/10000:.2f} ha (for reference)")
-    
-    # =================================================================
-    # Comparison
-    # =================================================================
-    logger.info(f"\n{'='*60}")
-    logger.info("COMPARISON")
-    logger.info(f"{'='*60}")
-    
-    # Perimeter-based comparison
-    diff = abs(numpy_area - jax_area)
-    diff_pct = diff / numpy_area * 100 if numpy_area > 0 else float('inf')
-    
-    logger.info(f"\nPerimeter-based:")
-    logger.info(f"  NumPy:     {numpy_area/10000:.2f} ha")
-    logger.info(f"  JAX:       {jax_area/10000:.2f} ha (self-intersecting polygon)")
-    logger.info(f"  Difference: {diff_pct:.1f}%")
-    
-    # Level-set comparison
-    ls_diff = abs(numpy_area - ls_area_m2)
-    ls_diff_pct = ls_diff / numpy_area * 100 if numpy_area > 0 else float('inf')
-    
-    # Isotropic comparison (for reference)
-    iso_diff_pct = abs(numpy_area - iso_area_m2) / numpy_area * 100 if numpy_area > 0 else float('inf')
-    
-    logger.info(f"\nLevel-set (elliptical):")
-    logger.info(f"  NumPy:     {numpy_area/10000:.2f} ha")
-    logger.info(f"  Level-set: {ls_area_m2/10000:.2f} ha")
-    logger.info(f"  Difference: {ls_diff_pct:.1f}%")
-    
-    logger.info(f"\nLevel-set (isotropic, for reference):")
-    logger.info(f"  Area: {iso_area_m2/10000:.2f} ha ({iso_diff_pct:.1f}% from NumPy)")
-    
-    # =================================================================
-    # Visualization with Observed Fire
-    # =================================================================
-    logger.info(f"\n{'='*60}")
-    logger.info("VISUALIZATION")
-    logger.info(f"{'='*60}")
-    
-    # Look for observed fire shapefile
-    observed_path = project_root / "data" / "OBrienCreekFire_2014.shp"
-    if not observed_path.exists():
-        # Try alternative names
-        for alt in ["observed.shp", "fire_boundary.shp", "perimeter.shp"]:
-            alt_path = project_root / "data" / alt
-            if alt_path.exists():
-                observed_path = alt_path
-                break
-    
-    if observed_path.exists():
-        try:
-            import geopandas as gpd
-            from ignacio.jax_core.visualization import (
-                load_observed_fire,
-                plot_comparison,
-                compute_metrics,
-                perimeter_to_polygon,
-                levelset_to_polygon,
-            )
-            
-            # Load observed fire and reproject to match DEM CRS
-            logger.info(f"Loading observed fire from {observed_path}")
-            obs_gdf = load_observed_fire(observed_path, target_crs="EPSG:4326")
-            obs_geom = obs_gdf.geometry.iloc[0]
-            obs_area_ha = obs_geom.area * meters_per_deg_lon * meters_per_deg_lat / 10000
-            logger.info(f"Observed fire area: {obs_area_ha:.2f} ha")
-            
-            # Create polygons for comparison
-            numpy_poly = perimeter_to_polygon(numpy_x, numpy_y)
-            ls_poly = levelset_to_polygon(np.array(phi), np.array(param_grid.x_coords), np.array(param_grid.y_coords))
-            
-            # Compute metrics
-            np_metrics = compute_metrics(numpy_poly, obs_geom)
-            ls_metrics = compute_metrics(ls_poly, obs_geom)
-            
-            logger.info(f"\nComparison with observed fire:")
-            logger.info(f"  NumPy:     IoU={np_metrics['iou']:.2%}, Area diff={np_metrics['area_diff_pct']:.1f}%")
-            logger.info(f"  Level-set: IoU={ls_metrics['iou']:.2%}, Area diff={ls_metrics['area_diff_pct']:.1f}%")
-            
-            # Create comparison plot
-            output_dir = project_root / "output"
-            output_dir.mkdir(exist_ok=True)
-            plot_path = output_dir / "fire_comparison.png"
-            
-            fig = plot_comparison(
-                observed_gdf=obs_gdf,
-                numpy_perimeter=(numpy_x, numpy_y),
-                jax_levelset=(np.array(phi), np.array(param_grid.x_coords), np.array(param_grid.y_coords)),
-                title=f"Fire Spread Comparison: {config.project.name}",
-                output_path=plot_path,
-            )
-            logger.info(f"Comparison plot saved to {plot_path}")
-            
-        except ImportError as e:
-            logger.warning(f"Could not create visualization: {e}")
-        except Exception as e:
-            logger.warning(f"Visualization error: {e}")
-    else:
-        logger.info(f"No observed fire shapefile found at {observed_path}")
-        logger.info("Skipping visualization")
-    
-    # =================================================================
-    # Final Result
-    # =================================================================
-    if ls_diff_pct < 5.0:
-        logger.info("\n✓ PASS: Level-set results match within 5%")
-        return 0
-    elif ls_diff_pct < 20.0:
-        logger.warning(f"\n~ CLOSE: Level-set results within 20% ({ls_diff_pct:.1f}%)")
-        logger.info("  This is acceptable for grid-based vs continuous methods")
-        return 0
-    else:
-        logger.error("\n✗ FAIL: Level-set results differ significantly")
-        return 1
+print("=" * 70)
+print("BOW VALLEY AT BANFF - FIRE SPREAD COMPARISON STUDY")
+print("=" * 70)
 
 
-def run_calibration(config_path: str = None, observed_path: str = None):
+# =============================================================================
+# Configuration Setup
+# =============================================================================
+
+def create_test_configs():
+    """Create test configurations for comparison."""
+    from ignacio.model_decisions import ModelDecisions, PRESETS
+    from ignacio.parameters import ParameterSet
+    from ignacio.config_unified import (
+        IgnacioConfig, InitialConditions, IgnitionPoint,
+        DomainConfig, OutputConfig, CalibrationConfig
+    )
+    
+    # Common domain (Bow Valley - approximately)
+    domain = DomainConfig(
+        resolution=30.0,
+        nx=150,
+        ny=150,
+        crs="EPSG:32611",  # UTM 11N
+        nz=15,
+        z_top=1500.0,
+    )
+    
+    # Common initial conditions (2014-03-08 scenario)
+    initial_conditions = InitialConditions(
+        ignition_points=[
+            IgnitionPoint(x=2250.0, y=2250.0, time=0.0, radius=30.0, name="main_ignition"),
+        ],
+        start_time=datetime(2014, 3, 8, 12, 0),
+        duration_hours=2.0,  # 2 hours for comparison
+        ffmc=88.0,
+        dmc=30.0,
+        dc=150.0,
+        bui=30.0,
+        moisture_1hr=6.0,
+        moisture_10hr=8.0,
+        moisture_100hr=10.0,
+        moisture_live=90.0,
+        initial_wind_speed=25.0,  # km/h
+        initial_wind_direction=270.0,  # From west
+        initial_temperature=15.0,
+        initial_rh=25.0,
+    )
+    
+    configs = {}
+    
+    # 1. Fast preset (minimal physics) - use lower base ROS
+    configs['fast'] = IgnacioConfig(
+        name="fast_simulation",
+        description="Minimal physics for fast simulation",
+        decisions=PRESETS['fast'],
+        parameters=ParameterSet(values={'ros_multiplier': 0.6}),
+        initial_conditions=initial_conditions,
+        domain=domain,
+        preset='fast',
+    )
+    
+    # 2. Operational preset - standard ROS
+    configs['operational'] = IgnacioConfig(
+        name="operational_simulation",
+        description="Standard operational settings",
+        decisions=PRESETS['operational'],
+        parameters=ParameterSet(values={'ros_multiplier': 0.8}),
+        initial_conditions=initial_conditions,
+        domain=domain,
+        preset='operational',
+    )
+    
+    # 3. Prometheus-compatible - slightly wider ellipse
+    configs['prometheus'] = IgnacioConfig(
+        name="prometheus_compatible",
+        description="Prometheus-compatible settings",
+        decisions=PRESETS['prometheus_compatible'],
+        parameters=ParameterSet(values={'ros_multiplier': 0.7, 'length_to_breadth': 1.5}),
+        initial_conditions=initial_conditions,
+        domain=domain,
+        preset='prometheus_compatible',
+    )
+    
+    # 4. Research preset (full physics) - higher ROS with narrow ellipse
+    configs['research'] = IgnacioConfig(
+        name="research_simulation",
+        description="Full physics for research",
+        decisions=PRESETS['research'],
+        parameters=ParameterSet(values={'ros_multiplier': 1.0, 'length_to_breadth': 3.0}),
+        initial_conditions=initial_conditions,
+        domain=domain,
+        preset='research',
+    )
+    
+    # 5. High wind scenario - strong wind effect
+    high_wind_ic = InitialConditions(
+        ignition_points=[
+            IgnitionPoint(x=2250.0, y=2250.0, time=0.0, radius=30.0, name="main_ignition"),
+        ],
+        start_time=datetime(2014, 3, 8, 12, 0),
+        duration_hours=2.0,  # Match other scenarios
+        ffmc=92.0,  # Higher fire danger
+        initial_wind_speed=40.0,  # Strong wind
+        initial_wind_direction=270.0,
+        initial_temperature=20.0,
+        initial_rh=20.0,
+    )
+    
+    configs['high_wind'] = IgnacioConfig(
+        name="high_wind_scenario",
+        description="High wind (40 km/h) scenario",
+        decisions=PRESETS['operational'],
+        parameters=ParameterSet(values={'ros_wind_factor': 1.5, 'length_to_breadth': 4.0}),
+        initial_conditions=high_wind_ic,
+        domain=domain,
+    )
+    
+    # 6. Low spread scenario - reduced all factors
+    configs['conservative'] = IgnacioConfig(
+        name="conservative_simulation",
+        description="Conservative spread estimate",
+        decisions=PRESETS['operational'],
+        parameters=ParameterSet(values={
+            'ros_multiplier': 0.5,
+            'ros_wind_factor': 0.7,
+            'ros_slope_factor': 0.5,
+        }),
+        initial_conditions=initial_conditions,
+        domain=domain,
+    )
+    
+    return configs
+
+
+# =============================================================================
+# Terrain Generation (Synthetic Bow Valley)
+# =============================================================================
+
+def create_synthetic_terrain(nx, ny, dx):
     """
-    Run calibration against observed fire.
+    Create synthetic terrain resembling Bow Valley.
     
-    This is a separate entry point for calibration.
+    Features:
+    - Central valley running E-W
+    - Mountains on north and south
+    - Ridges and gullies
     """
+    x = np.arange(nx) * dx
+    y = np.arange(ny) * dx
+    X, Y = np.meshgrid(x, y)
+    
+    # Base valley shape (lower in center)
+    valley_center = ny // 2 * dx
+    valley_width = ny // 3 * dx
+    valley = 200 * np.exp(-((Y - valley_center) / valley_width) ** 2)
+    
+    # Mountains (higher on edges)
+    mountains = 800 * (np.abs(Y - valley_center) / (ny * dx / 2)) ** 2
+    
+    # Add ridges (sinusoidal)
+    ridges = 100 * np.sin(2 * np.pi * X / (nx * dx / 4)) * np.cos(2 * np.pi * Y / (ny * dx / 3))
+    
+    # Combine
+    elevation = 1400 + mountains - valley + ridges
+    
+    # Add some noise for realism
+    np.random.seed(42)
+    noise = 20 * np.random.randn(ny, nx)
+    elevation += noise
+    
+    return elevation.astype(np.float32)
+
+
+def compute_slope_aspect(dem, dx, dy):
+    """Compute slope and aspect from DEM."""
+    # Gradient in x and y
+    dzdx = np.gradient(dem, dx, axis=1)
+    dzdy = np.gradient(dem, dy, axis=0)
+    
+    # Slope in degrees
+    slope = np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2)))
+    
+    # Aspect in degrees (0 = North, clockwise)
+    aspect = np.degrees(np.arctan2(-dzdx, -dzdy))
+    aspect = (aspect + 360) % 360
+    
+    return slope, aspect
+
+
+# =============================================================================
+# Run Simulation
+# =============================================================================
+
+def run_simulation(config, terrain, verbose=True):
+    """Run fire simulation with given config and terrain."""
     import jax
     import jax.numpy as jnp
-    jax.config.update("jax_enable_x64", True)
+    from ignacio.jax_core import (
+        initialize_phi,
+        evolve_phi,
+        LevelSetGrids,
+    )
     
-    project_root = Path(__file__).parent.parent
-    
-    # Load config
-    from ignacio.config import load_config
-    from ignacio.terrain import build_terrain_grids
-    from ignacio.simulation import build_parameter_grid
-    from ignacio.weather import process_fire_weather, load_weather_data
-    from ignacio.ignition import generate_ignitions
-    from ignacio.io import read_raster_int
-    
-    config_path = config_path or str(project_root / "ignacio.yaml")
-    config = load_config(config_path)
-    rng = np.random.default_rng(config.project.random_seed)
-    
-    logger.info(f"Running calibration for {config.project.name}")
-    
-    # Build grids (same as main test)
-    terrain = build_terrain_grids(config)
-    
-    hourly_data = None
-    if config.simulation.time_varying_weather:
-        hourly_data = load_weather_data(config)
-    
-    weather = process_fire_weather(config, rng)
-    param_grid = build_parameter_grid(config, terrain, weather, hourly_data=hourly_data)
+    nx = config.domain.nx
+    ny = config.domain.ny
+    dx = config.domain.resolution
     
     # Get ignition
-    fuel_raster = read_raster_int(config.fuel.path)
-    terrain_crs = str(terrain.crs) if terrain.crs else None
-    ignitions = generate_ignitions(config, fuel_raster, rng, terrain_crs=terrain_crs)
-    ign = ignitions.points[0]
-    x_ign, y_ign = ign.x, ign.y
-    logger.info(f"Ignition: ({x_ign:.6f}, {y_ign:.6f})")
-    
-    # Load observed fire
-    observed_path = observed_path or str(project_root / "data" / "OBrienCreekFire_2014.shp")
-    
-    import geopandas as gpd
-    from ignacio.jax_core.visualization import load_observed_fire
-    from ignacio.jax_core.levelset import LevelSetGrids
-    from ignacio.jax_core.levelset_calibration import (
-        calibrate_to_observed,
-        create_obs_mask_from_polygon_fast,
-        apply_calibration_params,
-    )
-    
-    obs_gdf = load_observed_fire(observed_path, target_crs="EPSG:4326")
-    obs_geom = obs_gdf.geometry.iloc[0]
-    
-    # Coordinate conversion
-    center_lat = (param_grid.y_min + param_grid.y_max) / 2
-    lat_rad = np.radians(center_lat)
-    meters_per_deg_lon = 111320.0 * np.cos(lat_rad)
-    meters_per_deg_lat = 111320.0
-    avg_meters_per_deg = (meters_per_deg_lat + meters_per_deg_lon) / 2.0
-    
-    obs_area = obs_geom.area * meters_per_deg_lon * meters_per_deg_lat
-    logger.info(f"Observed fire area: {obs_area/10000:.2f} ha")
-    
-    # Create observation mask
-    logger.info("Creating observation mask...")
-    obs_mask = create_obs_mask_from_polygon_fast(
-        obs_geom,
-        np.array(param_grid.x_coords),
-        np.array(param_grid.y_coords),
-    )
-    logger.info(f"Observation mask: {np.sum(obs_mask)} burned cells")
-    
-    # Convert ROS to deg/min
-    ros_jax = param_grid.ros / avg_meters_per_deg
-    bros_jax = param_grid.bros / avg_meters_per_deg
-    fros_jax = param_grid.fros / avg_meters_per_deg
-    
-    # Create level-set grids
-    ls_grids = LevelSetGrids(
-        x_coords=jnp.array(param_grid.x_coords),
-        y_coords=jnp.array(param_grid.y_coords),
-        ros=jnp.array(ros_jax),
-        bros=jnp.array(bros_jax),
-        fros=jnp.array(fros_jax),
-        raz=jnp.array(param_grid.raz),
-    )
-    
-    # Simulation params
-    dt = config.simulation.dt
-    n_steps = int(config.simulation.max_duration / dt)
-    initial_radius = config.simulation.initial_radius / avg_meters_per_deg
-    
-    # Run calibration
-    logger.info("Starting calibration...")
-    logger.info(f"  Grid: {len(ls_grids.x_coords)}x{len(ls_grids.y_coords)} cells = {len(ls_grids.x_coords)*len(ls_grids.y_coords)} total")
-    logger.info(f"  Time steps: {n_steps} (will subsample for calibration)")
-    
-    result = calibrate_to_observed(
-        grids=ls_grids,
-        x_ign=x_ign,
-        y_ign=y_ign,
-        n_steps=n_steps,
-        dt=dt,
-        initial_radius=initial_radius,
-        obs_mask=jnp.array(obs_mask),
-        obs_area=obs_area / (meters_per_deg_lon * meters_per_deg_lat),  # Convert to deg²
-        n_iterations=30,  # Fewer iterations for faster testing
-        learning_rate=0.2,
-        verbose=True,
-        subsample_steps=50,  # Use 50 time steps for calibration (faster)
-        max_grid_cells=100000,  # Subsample spatially if > 100k cells
-    )
-    
-    logger.info(f"\nCalibration complete!")
-    logger.info(f"Final parameters:")
-    logger.info(f"  ROS scale:  {result.params.ros_scale:.3f}")
-    logger.info(f"  BROS scale: {result.params.bros_scale:.3f}")
-    logger.info(f"  FROS scale: {result.params.fros_scale:.3f}")
-    
-    # Run simulation with calibrated params
-    from ignacio.jax_core.levelset import simulate_fire_levelset_with_area
-    
-    calibrated_grids = apply_calibration_params(ls_grids, result.params)
-    phi_cal, area_cal = simulate_fire_levelset_with_area(
-        calibrated_grids, x_ign, y_ign,
-        n_steps=n_steps, dt=dt, initial_radius=initial_radius,
-        differentiable=False, use_ellipse=True,
-    )
-    
-    cal_area_m2 = float(area_cal) * meters_per_deg_lon * meters_per_deg_lat
-    logger.info(f"\nCalibrated simulation area: {cal_area_m2/10000:.2f} ha")
-    logger.info(f"Observed area: {obs_area/10000:.2f} ha")
-    logger.info(f"Difference: {abs(cal_area_m2 - obs_area)/obs_area*100:.1f}%")
-    
-    # Save calibration plot
-    from ignacio.jax_core.visualization import plot_calibration_progress, plot_comparison
-    
-    output_dir = project_root / "output"
-    output_dir.mkdir(exist_ok=True)
-    
-    # Plot calibration progress
-    plot_calibration_progress(
-        result.loss_history,
-        result.params_history,
-        output_path=output_dir / "calibration_progress.png",
-    )
-    
-    # Plot comparison with calibrated result
-    plot_comparison(
-        observed_gdf=obs_gdf,
-        jax_levelset=(np.array(phi_cal), np.array(param_grid.x_coords), np.array(param_grid.y_coords)),
-        title=f"Calibrated Fire Spread: {config.project.name}",
-        output_path=output_dir / "fire_comparison_calibrated.png",
-    )
-    
-    return result
-
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Fire spread comparison and calibration")
-    parser.add_argument("--calibrate", action="store_true", help="Run calibration against observed fire")
-    parser.add_argument("--observed", type=str, help="Path to observed fire shapefile")
-    parser.add_argument("--config", type=str, help="Path to config YAML")
-    
-    args = parser.parse_args()
-    
-    if args.calibrate:
-        run_calibration(config_path=args.config, observed_path=args.observed)
+    if config.initial_conditions.ignition_points:
+        ign = config.initial_conditions.ignition_points[0]
+        x_ign, y_ign = ign.x, ign.y
     else:
-        sys.exit(main())
+        x_ign = nx * dx / 2
+        y_ign = ny * dx / 2
+    
+    # Create coordinates
+    x_coords = jnp.arange(nx) * dx
+    y_coords = jnp.arange(ny) * dx
+    
+    # Initialize level-set
+    phi = initialize_phi(x_coords, y_coords, x_ign, y_ign, initial_radius=30.0)
+    
+    # Compute terrain effects
+    slope, aspect = compute_slope_aspect(terrain, dx, dx)
+    
+    # Wind direction and speed
+    wind_dir_rad = np.radians(config.initial_conditions.initial_wind_direction)
+    wind_speed_kmh = config.initial_conditions.initial_wind_speed
+    
+    # Base ROS from FBP (simplified) - typical C-2 boreal forest
+    # ISI effect on ROS: ROS = a * (1 - exp(-b * ISI))^c
+    # Simplified: use wind to estimate effective spread rate
+    base_ros = 5.0 * config.parameters.get('ros_multiplier')  # m/min base rate
+    
+    # Wind effect on ROS (simplified FBP wind function)
+    # Wind increases spread rate significantly
+    wind_factor = 1.0 + 0.1 * wind_speed_kmh * config.parameters.get('ros_wind_factor')
+    
+    # Slope effect
+    slope_rad = np.radians(slope)
+    slope_factor = 1.0 + 3.0 * np.sin(slope_rad) * config.parameters.get('ros_slope_factor')
+    slope_factor = np.clip(slope_factor, 0.5, 5.0)
+    
+    # Compute ROS field
+    ros = base_ros * wind_factor * slope_factor
+    ros = np.clip(ros, 1.0, 50.0)  # Max 50 m/min for stability (CFL)
+    ros = jnp.array(ros.astype(np.float32))
+    
+    if verbose:
+        print(f"    ROS range: {float(jnp.min(ros)):.1f} - {float(jnp.max(ros)):.1f} m/min")
+    
+    # Back and flank ROS
+    lb_ratio = config.parameters.get('length_to_breadth')
+    bros = ros / lb_ratio
+    fros = ros / np.sqrt(lb_ratio)
+    
+    # Spread direction (wind direction + terrain modification)
+    # Simplified: just use wind direction
+    raz = jnp.full((ny, nx), wind_dir_rad, dtype=jnp.float32)
+    
+    # Create grids
+    grids = LevelSetGrids(
+        x_coords=x_coords,
+        y_coords=y_coords,
+        ros=ros,
+        bros=bros,
+        fros=fros,
+        raz=raz,
+    )
+    
+    # Run simulation
+    duration_min = config.initial_conditions.duration_hours * 60
+    
+    # CFL condition: dt * max_ros < dx
+    # Use 0.5 safety factor
+    max_ros = float(jnp.max(ros))
+    dt = min(1.0, 0.5 * dx / max_ros)  # Adaptive time step
+    n_steps = int(duration_min / dt)
+    
+    if verbose:
+        print(f"    Time step: {dt:.2f} min (CFL-limited)")
+    
+    # Store history for animation
+    store_interval = max(1, n_steps // 50)  # ~50 frames
+    phi_history = [np.array(phi)]
+    times = [0.0]
+    
+    if verbose:
+        print(f"  Running {n_steps} steps ({duration_min:.0f} min)...")
+    
+    t_start = time.time()
+    
+    for step in range(n_steps):
+        phi = evolve_phi(phi, grids, t_idx=0, dt=dt)
+        
+        if (step + 1) % store_interval == 0:
+            phi_history.append(np.array(phi))
+            times.append((step + 1) * dt)
+    
+    elapsed = time.time() - t_start
+    
+    # Final metrics
+    burned_area = float(jnp.sum(phi < 0)) * dx * dx / 10000  # ha
+    
+    if verbose:
+        print(f"  Completed in {elapsed:.2f}s ({elapsed/n_steps*1000:.1f} ms/step)")
+        print(f"  Burned area: {burned_area:.2f} ha")
+    
+    return {
+        'phi_final': np.array(phi),
+        'phi_history': np.array(phi_history),
+        'times': np.array(times),
+        'burned_area_ha': burned_area,
+        'elapsed_s': elapsed,
+        'config': config,
+    }
+
+
+# =============================================================================
+# Visualization
+# =============================================================================
+
+def plot_comparison(results, terrain, output_dir):
+    """Create comparison plot of all configurations."""
+    n = len(results)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 5*rows))
+    if n == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+    
+    for idx, (name, result) in enumerate(results.items()):
+        ax = axes[idx]
+        
+        # Plot terrain as background
+        ax.contourf(terrain, levels=20, cmap='terrain', alpha=0.5)
+        
+        # Plot burned area
+        burned = result['phi_final'] < 0
+        ax.contourf(burned, levels=[0.5, 1], colors=['red'], alpha=0.6)
+        
+        # Plot fire perimeter
+        ax.contour(result['phi_final'], levels=[0], colors=['darkred'], linewidths=2)
+        
+        # Title
+        area = result['burned_area_ha']
+        ax.set_title(f"{name}\n{area:.1f} ha", fontsize=10)
+        ax.set_aspect('equal')
+        ax.axis('off')
+    
+    # Hide unused
+    for idx in range(n, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle('Bow Valley Fire Spread Comparison', fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(output_dir / 'comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved comparison plot: {output_dir / 'comparison.png'}")
+
+
+def create_animation(result, terrain, output_path, fps=10):
+    """Create animated GIF of fire spread."""
+    phi_history = result['phi_history']
+    times = result['times']
+    dx = 30.0  # Grid spacing
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Get consistent color limits
+    ny, nx = terrain.shape
+    
+    def update(frame):
+        ax.clear()
+        
+        # Terrain background
+        ax.contourf(terrain, levels=20, cmap='terrain', alpha=0.5)
+        
+        # Burned area
+        burned = phi_history[frame] < 0
+        if np.any(burned):
+            ax.contourf(burned, levels=[0.5, 1], colors=['red'], alpha=0.6)
+        
+        # Fire perimeter
+        ax.contour(phi_history[frame], levels=[0], colors=['darkred'], linewidths=2)
+        
+        # Time label
+        t = times[frame]
+        area = np.sum(burned) * dx**2 / 10000
+        ax.set_title(f'Fire Spread - {t:.0f} min\nBurned: {area:.1f} ha')
+        ax.set_aspect('equal')
+        ax.axis('off')
+    
+    anim = FuncAnimation(fig, update, frames=len(phi_history), interval=1000/fps)
+    
+    anim.save(str(output_path), writer=PillowWriter(fps=fps))
+    plt.close()
+    
+    print(f"Saved animation: {output_path}")
+
+
+def plot_burned_area_timeline(results, output_dir):
+    """Plot burned area over time for all configs."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    dx = 30.0
+    
+    for name, result in results.items():
+        phi_history = result['phi_history']
+        times = result['times']
+        
+        # Calculate burned area at each time
+        areas = [np.sum(phi < 0) * dx**2 / 10000 for phi in phi_history]
+        
+        ax.plot(times, areas, label=name, linewidth=2)
+    
+    ax.set_xlabel('Time (minutes)')
+    ax.set_ylabel('Burned Area (ha)')
+    ax.set_title('Fire Growth Comparison - Bow Valley')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'growth_curves.png', dpi=150)
+    plt.close()
+    
+    print(f"Saved growth curves: {output_dir / 'growth_curves.png'}")
+
+
+def create_combined_animation(results, terrain, output_path, fps=8):
+    """Create side-by-side animation comparing configurations."""
+    n = len(results)
+    if n > 4:
+        n = 4  # Limit to 4 for readability
+        results = dict(list(results.items())[:4])
+    
+    cols = 2
+    rows = (n + 1) // 2
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(10, 5*rows))
+    axes = axes.flatten() if n > 1 else [axes]
+    
+    # Get max frames
+    max_frames = max(len(r['phi_history']) for r in results.values())
+    dx = 30.0
+    
+    def update(frame):
+        for idx, (name, result) in enumerate(results.items()):
+            if idx >= len(axes):
+                break
+            ax = axes[idx]
+            ax.clear()
+            
+            # Get frame (or last frame if exceeded)
+            f = min(frame, len(result['phi_history']) - 1)
+            phi = result['phi_history'][f]
+            t = result['times'][f]
+            
+            # Terrain
+            ax.contourf(terrain, levels=15, cmap='terrain', alpha=0.4)
+            
+            # Burned
+            burned = phi < 0
+            if np.any(burned):
+                ax.contourf(burned, levels=[0.5, 1], colors=['red'], alpha=0.6)
+            
+            # Perimeter
+            ax.contour(phi, levels=[0], colors=['darkred'], linewidths=2)
+            
+            area = np.sum(burned) * dx**2 / 10000
+            ax.set_title(f'{name}\n{t:.0f} min | {area:.1f} ha', fontsize=10)
+            ax.set_aspect('equal')
+            ax.axis('off')
+        
+        # Hide unused
+        for idx in range(n, len(axes)):
+            axes[idx].axis('off')
+    
+    anim = FuncAnimation(fig, update, frames=max_frames, interval=1000/fps)
+    anim.save(str(output_path), writer=PillowWriter(fps=fps))
+    plt.close()
+    
+    print(f"Saved combined animation: {output_path}")
+
+
+# =============================================================================
+# Summary Statistics
+# =============================================================================
+
+def print_summary_table(results):
+    """Print summary table of results."""
+    print("\n" + "=" * 80)
+    print("SUMMARY TABLE")
+    print("=" * 80)
+    print(f"{'Configuration':<25} {'Preset':<15} {'Area (ha)':<12} {'Time (s)':<10} {'ROS mult':<10}")
+    print("-" * 80)
+    
+    for name, result in results.items():
+        config = result['config']
+        preset = config.preset or 'custom'
+        area = result['burned_area_ha']
+        elapsed = result['elapsed_s']
+        ros_mult = config.parameters.get('ros_multiplier')
+        
+        print(f"{name:<25} {preset:<15} {area:<12.2f} {elapsed:<10.2f} {ros_mult:<10.2f}")
+    
+    print("=" * 80)
+
+
+# =============================================================================
+# Simplified Run (without full config infrastructure)
+# =============================================================================
+
+def run_simplified_comparison():
+    """Run comparison with simplified configs (no dependencies on config_unified)."""
+    from dataclasses import dataclass, field
+    from typing import List
+    
+    @dataclass
+    class SimpleIgnitionPoint:
+        x: float
+        y: float
+        time: float = 0.0
+        radius: float = 30.0
+        name: str = ""
+    
+    @dataclass 
+    class SimpleParams:
+        values: dict = field(default_factory=dict)
+        
+        def get(self, name):
+            defaults = {
+                'ros_multiplier': 1.0,
+                'ros_wind_factor': 1.0,
+                'ros_slope_factor': 1.0,
+                'length_to_breadth': 2.0,
+            }
+            return self.values.get(name, defaults.get(name, 1.0))
+    
+    @dataclass
+    class SimpleDomain:
+        nx: int = 150
+        ny: int = 150
+        resolution: float = 30.0
+    
+    @dataclass
+    class SimpleIC:
+        ignition_points: List = field(default_factory=list)
+        duration_hours: float = 4.0
+        initial_wind_speed: float = 25.0
+        initial_wind_direction: float = 270.0
+        ffmc: float = 88.0
+        
+        def __post_init__(self):
+            if not self.ignition_points:
+                self.ignition_points = [SimpleIgnitionPoint(x=2250, y=2250)]
+    
+    @dataclass
+    class SimpleConfig:
+        name: str
+        preset: str = 'custom'
+        parameters: SimpleParams = field(default_factory=SimpleParams)
+        domain: SimpleDomain = field(default_factory=SimpleDomain)
+        initial_conditions: SimpleIC = field(default_factory=SimpleIC)
+    
+    # Create configurations
+    configs = {
+        'baseline': SimpleConfig(
+            name='baseline',
+            preset='operational',
+        ),
+        'high_ros': SimpleConfig(
+            name='high_ros',
+            preset='custom',
+            parameters=SimpleParams(values={'ros_multiplier': 1.5}),
+        ),
+        'high_wind': SimpleConfig(
+            name='high_wind',
+            preset='custom',
+            initial_conditions=SimpleIC(initial_wind_speed=40.0),
+        ),
+        'narrow_ellipse': SimpleConfig(
+            name='narrow_ellipse',
+            preset='custom',
+            parameters=SimpleParams(values={'length_to_breadth': 4.0}),
+        ),
+        'wide_ellipse': SimpleConfig(
+            name='wide_ellipse',
+            preset='custom',
+            parameters=SimpleParams(values={'length_to_breadth': 1.5}),
+        ),
+    }
+    
+    return configs
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    """Run the comparison study."""
+    
+    # Create output directory
+    output_dir = Path('./output/bow_valley_comparison')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nOutput directory: {output_dir}")
+    
+    # Try to create full configurations, fall back to simplified
+    print("\nCreating test configurations...")
+    try:
+        configs = create_test_configs()
+        print(f"  Created {len(configs)} configurations (full infrastructure)")
+    except Exception as e:
+        print(f"  Full config failed: {e}")
+        print("  Using simplified configurations...")
+        configs = run_simplified_comparison()
+        print(f"  Created {len(configs)} simplified configurations")
+    
+    # Create synthetic terrain
+    print("\nCreating synthetic Bow Valley terrain...")
+    nx, ny = 150, 150
+    dx = 30.0
+    terrain = create_synthetic_terrain(nx, ny, dx)
+    print(f"  Terrain shape: {terrain.shape}")
+    print(f"  Elevation range: {terrain.min():.0f} - {terrain.max():.0f} m")
+    
+    # Save terrain
+    plt.figure(figsize=(8, 8))
+    plt.contourf(terrain, levels=20, cmap='terrain')
+    plt.colorbar(label='Elevation (m)')
+    plt.title('Synthetic Bow Valley Terrain')
+    plt.axis('equal')
+    plt.savefig(output_dir / 'terrain.png', dpi=150)
+    plt.close()
+    print(f"  Saved terrain plot: {output_dir / 'terrain.png'}")
+    
+    # Run simulations
+    print("\nRunning simulations...")
+    results = {}
+    
+    for name, config in configs.items():
+        print(f"\n  {name}:")
+        try:
+            result = run_simulation(config, terrain, verbose=True)
+            results[name] = result
+        except Exception as e:
+            print(f"    Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    if not results:
+        print("\nNo successful simulations. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\nCreating visualizations...")
+    
+    # Comparison plot
+    plot_comparison(results, terrain, output_dir)
+    
+    # Growth curves
+    plot_burned_area_timeline(results, output_dir)
+    
+    # Create individual animations
+    print("\nCreating individual animations...")
+    for name, result in results.items():
+        gif_path = output_dir / f'animation_{name}.gif'
+        try:
+            create_animation(result, terrain, gif_path, fps=8)
+        except Exception as e:
+            print(f"  Could not create animation for {name}: {e}")
+    
+    # Create combined animation
+    print("\nCreating combined animation...")
+    try:
+        create_combined_animation(results, terrain, output_dir / 'comparison.gif', fps=8)
+    except Exception as e:
+        print(f"  Could not create combined animation: {e}")
+    
+    # Summary table
+    print_summary_table(results)
+    
+    # Final message
+    print("\n" + "=" * 70)
+    print("COMPARISON COMPLETE")
+    print("=" * 70)
+    print(f"Results saved to: {output_dir}")
+    print("\nFiles created:")
+    for f in sorted(output_dir.glob('*')):
+        size = f.stat().st_size / 1024
+        print(f"  {f.name}: {size:.1f} KB")
+
+
+if __name__ == '__main__':
+    main()

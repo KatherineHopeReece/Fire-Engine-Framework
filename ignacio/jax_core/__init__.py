@@ -325,6 +325,72 @@ from .simulation_full import (
     quick_full_simulation,
 )
 
+# 3D Atmospheric Dynamics (WRF-SFIRE style)
+from .atmosphere_3d import (
+    AtmosphereParams,
+    AtmosphereState,
+    AtmosphereGrids,
+    CouplingResult,
+    create_vertical_grid,
+    create_atmosphere_grids,
+    compute_base_state,
+    initialize_atmosphere,
+    compute_fire_heat_source,
+    advect_scalar,
+    compute_divergence,
+    pressure_projection,
+    compute_buoyancy,
+    apply_diffusion,
+    evolve_atmosphere_step,
+    couple_atmosphere_to_fire,
+    run_coupled_simulation as run_atmosphere_simulation,
+    quick_atmosphere_test,
+    summarize_atmosphere_state,
+)
+
+# Coupled Fire-Atmosphere Simulation
+from .coupled_simulation import (
+    CoupledSimConfig,
+    CoupledSimState,
+    CoupledSimResult,
+    create_compatible_grids,
+    compute_coupled_fire_intensity,
+    update_fire_winds_from_atmosphere,
+    initialize_coupled_simulation,
+    evolve_coupled_step,
+    run_coupled_simulation,
+    quick_coupled_test,
+    compare_coupled_vs_uncoupled,
+)
+
+# 3D Atmospheric Dynamics (WRF-style)
+from .atmosphere_3d import (
+    AtmosphereParams,
+    AtmosphereState,
+    AtmosphereGrids,
+    CouplingResult,
+    create_vertical_grid,
+    create_atmosphere_grids,
+    compute_base_state,
+    initialize_atmosphere,
+    evolve_atmosphere_step,
+    couple_atmosphere_to_fire,
+    run_coupled_simulation as run_atmosphere_simulation,
+    quick_atmosphere_test,
+    summarize_atmosphere_state,
+)
+
+# WRF-SFIRE Style Coupled Fire-Atmosphere
+from .coupled_fire_atm import (
+    CoupledSimConfig,
+    CoupledSimState,
+    CoupledSimResult,
+    initialize_coupled_simulation,
+    evolve_coupled_step,
+    run_coupled_simulation,
+    quick_coupled_test,
+)
+
 
 __all__ = [
     # New core (recommended)
@@ -550,4 +616,36 @@ __all__ = [
     "evolve_full_step",
     "run_full_simulation",
     "quick_full_simulation",
+    # 3D Atmospheric Dynamics (WRF-style)
+    "AtmosphereParams",
+    "AtmosphereState",
+    "AtmosphereGrids",
+    "CouplingResult",
+    "create_vertical_grid",
+    "create_atmosphere_grids",
+    "compute_base_state",
+    "initialize_atmosphere",
+    "compute_fire_heat_source",
+    "advect_scalar",
+    "compute_divergence",
+    "pressure_projection",
+    "compute_buoyancy",
+    "apply_diffusion",
+    "evolve_atmosphere_step",
+    "couple_atmosphere_to_fire",
+    "run_atmosphere_simulation",
+    "quick_atmosphere_test",
+    "summarize_atmosphere_state",
+    # WRF-SFIRE Style Coupled Simulation
+    "CoupledSimConfig",
+    "CoupledSimState",
+    "CoupledSimResult",
+    "create_compatible_grids",
+    "compute_coupled_fire_intensity",
+    "update_fire_winds_from_atmosphere",
+    "initialize_coupled_simulation",
+    "evolve_coupled_step",
+    "run_coupled_simulation",
+    "quick_coupled_test",
+    "compare_coupled_vs_uncoupled",
 ]

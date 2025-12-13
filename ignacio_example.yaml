@@ -27,7 +27,7 @@ crs:
 # Terrain Data
 # -----------------------------------------------------------------------------
 terrain:
-  dem_path: "./data/dem_30m.tif"
+  dem_path: "./data/DEM.tif"
   slope_path: null  # Optional: will compute from DEM if null
   aspect_path: null  # Optional: will compute from DEM if null
 
@@ -36,7 +36,7 @@ terrain:
 # -----------------------------------------------------------------------------
 fuel:
   source_type: "raster"
-  path: "./data/fuel_fbp.tif"
+  path: "./data/fuels.tif"
   non_fuel_codes: [0, -1, 101, 102]
   
   # FBP fuel type lookup (raster value -> FBP code)

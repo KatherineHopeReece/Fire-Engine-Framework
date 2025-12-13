@@ -14,10 +14,16 @@ The system integrates:
 - Terrain corrections for slope and aspect
 - JAX-based differentiable fire spread (optional)
 - Enhanced physics: solar radiation, moisture lag, crown fire, terrain wind
+- 3D atmospheric dynamics (WRF-SFIRE style coupling)
+- SUMMA-style model decisions configuration
 
 Modules
 -------
 config : Configuration loading and validation
+config_unified : SUMMA-style unified configuration
+model_decisions : Model physics choices
+parameters : Tunable parameters with bounds
+vector_topology : Shapely-based polygon repair
 io : Raster and vector I/O utilities
 terrain : DEM processing, slope and aspect calculation
 ignition : Ignition probability and point sampling
@@ -40,9 +46,10 @@ References
   Fire Weather Index System.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "Fire Engine Framework Contributors"
 
+# Original config
 from ignacio.config import (
     load_config, 
     IgnacioConfig,
@@ -51,14 +58,100 @@ from ignacio.config import (
     DataSourceConfig,
 )
 
+# New unified config system
+try:
+    from ignacio.config_unified import (
+        IgnacioConfig as UnifiedConfig,
+        load_config as load_unified_config,
+        create_config_from_preset,
+        InitialConditions,
+        IgnitionPoint,
+        DomainConfig,
+        OutputConfig,
+        CalibrationConfig,
+    )
+    from ignacio.model_decisions import (
+        ModelDecisions,
+        get_default_decisions,
+        get_preset,
+        PRESETS,
+        ALL_DECISIONS,
+    )
+    from ignacio.parameters import (
+        ParameterSet,
+        ParameterDef,
+        get_default_parameters,
+        ALL_PARAMETERS,
+        CALIBRATABLE_PARAMETERS,
+        list_calibratable_parameters,
+    )
+    HAS_UNIFIED_CONFIG = True
+except ImportError:
+    HAS_UNIFIED_CONFIG = False
+
+# Vector topology (optional, requires Shapely)
+try:
+    from ignacio.vector_topology import (
+        FirePerimeter,
+        clip_perimeter,
+        merge_perimeters,
+        levelset_to_perimeter,
+        export_prometheus_format,
+        process_fire_perimeters,
+        generate_isochrones,
+    )
+    HAS_VECTOR_TOPOLOGY = True
+except ImportError:
+    HAS_VECTOR_TOPOLOGY = False
+
 # Don't import simulation here to avoid circular imports with rasterio
 # from ignacio.simulation import run_simulation
 
 __all__ = [
+    # Original config
     "load_config",
     "IgnacioConfig",
     "IgnitionCoordinate", 
     "PhysicsConfig",
     "DataSourceConfig",
+    # Version
     "__version__",
+    # Feature flags
+    "HAS_UNIFIED_CONFIG",
+    "HAS_VECTOR_TOPOLOGY",
 ]
+
+# Add unified config exports if available
+if HAS_UNIFIED_CONFIG:
+    __all__.extend([
+        "UnifiedConfig",
+        "load_unified_config",
+        "create_config_from_preset",
+        "InitialConditions",
+        "IgnitionPoint",
+        "DomainConfig",
+        "OutputConfig",
+        "CalibrationConfig",
+        "ModelDecisions",
+        "get_default_decisions",
+        "get_preset",
+        "PRESETS",
+        "ALL_DECISIONS",
+        "ParameterSet",
+        "ParameterDef",
+        "get_default_parameters",
+        "ALL_PARAMETERS",
+        "CALIBRATABLE_PARAMETERS",
+        "list_calibratable_parameters",
+    ])
+
+if HAS_VECTOR_TOPOLOGY:
+    __all__.extend([
+        "FirePerimeter",
+        "clip_perimeter",
+        "merge_perimeters",
+        "levelset_to_perimeter",
+        "export_prometheus_format",
+        "process_fire_perimeters",
+        "generate_isochrones",
+    ])
