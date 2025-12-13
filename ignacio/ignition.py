@@ -384,6 +384,10 @@ def generate_ignitions(
     ign_config = config.ignition
     crs = config.crs.working_crs
     
+    # Handle coordinates-based ignition (NEW)
+    if ign_config.source_type == "coordinates":
+        return _load_coordinate_ignitions(config, terrain_crs=terrain_crs)
+    
     # Handle point-based ignition
     if ign_config.source_type in ("point", "shapefile"):
         return _load_point_ignitions(config, terrain_crs=terrain_crs)
@@ -470,6 +474,75 @@ def generate_ignitions(
     logger.info(f"Generated {len(all_points)} total ignition points across {ign_config.n_iterations} iterations")
     
     return IgnitionSet(points=all_points, crs=crs)
+
+
+def _load_coordinate_ignitions(config: IgnacioConfig, terrain_crs: str | None = None) -> IgnitionSet:
+    """Load ignition points from config coordinates list.
+    
+    Parameters
+    ----------
+    config : IgnacioConfig
+        Configuration object with coordinates in ignition.coordinates
+    terrain_crs : str, optional
+        CRS of the terrain grid. If provided, ignitions will be reprojected
+        to match this CRS instead of the working_crs.
+        
+    Returns
+    -------
+    IgnitionSet
+        Set of ignition points from config coordinates.
+    """
+    from pyproj import CRS, Transformer
+    
+    ign_config = config.ignition
+    
+    # Use terrain CRS if provided, otherwise fall back to working CRS
+    if terrain_crs is not None:
+        target_crs = terrain_crs
+        logger.info(f"Using terrain CRS for ignitions: {target_crs}")
+    else:
+        target_crs = config.crs.working_crs
+    
+    coords = ign_config.coordinates
+    logger.info(f"Loading {len(coords)} ignition points from config coordinates")
+    
+    if len(coords) == 0:
+        logger.warning("No coordinates found in ignition config")
+        return IgnitionSet(points=[], crs=target_crs)
+    
+    # Check if coordinates need reprojection
+    # Assume coordinates are in WGS84 (EPSG:4326) unless working_crs is geographic
+    source_crs_obj = CRS.from_user_input("EPSG:4326")
+    target_crs_obj = CRS.from_user_input(target_crs)
+    
+    need_transform = not source_crs_obj.equals(target_crs_obj)
+    if need_transform:
+        transformer = Transformer.from_crs(source_crs_obj, target_crs_obj, always_xy=True)
+        logger.info(f"Transforming coordinates from EPSG:4326 to {target_crs}")
+    
+    points = []
+    for i, coord in enumerate(coords):
+        x, y = coord.x, coord.y
+        
+        # Transform if needed
+        if need_transform:
+            x, y = transformer.transform(x, y)
+        
+        name = coord.name or f"ignition_{i+1}"
+        logger.debug(f"Ignition '{name}': ({x:.6f}, {y:.6f})")
+        
+        point = IgnitionPoint(
+            x=x,
+            y=y,
+            cause=ign_config.cause,
+            season=ign_config.season,
+            iteration=0,  # All coordinates are iteration 0
+        )
+        points.append(point)
+    
+    logger.info(f"Created {len(points)} ignition points from config")
+    
+    return IgnitionSet(points=points, crs=target_crs)
 
 
 def _load_point_ignitions(config: IgnacioConfig, terrain_crs: str | None = None) -> IgnitionSet:

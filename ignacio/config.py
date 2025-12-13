@@ -76,12 +76,28 @@ class IgnitionRule(BaseModel):
     season: str | None = None
 
 
+class IgnitionCoordinate(BaseModel):
+    """Single ignition point coordinate."""
+    
+    x: float = Field(..., description="X coordinate (longitude or easting)")
+    y: float = Field(..., description="Y coordinate (latitude or northing)")
+    name: str | None = Field(None, description="Optional point name")
+    time_offset: float = Field(0.0, description="Time offset from simulation start (minutes)")
+
+
 class IgnitionConfig(BaseModel):
     """Ignition configuration."""
     
-    source_type: Literal["grid", "point", "shapefile"] = Field("grid")
+    source_type: Literal["grid", "point", "shapefile", "coordinates"] = Field("grid")
     grid_path: Path | None = Field(None)
     point_path: Path | None = Field(None)
+    
+    # NEW: Direct coordinate specification
+    coordinates: list[IgnitionCoordinate] = Field(
+        default_factory=list,
+        description="List of ignition coordinates (used when source_type='coordinates')"
+    )
+    
     cause: Literal["Lightning", "Human"] = Field("Lightning")
     season: Literal["Spring", "Summer", "Fall"] = Field("Summer")
     n_iterations: int = Field(10, ge=1)
@@ -96,11 +112,13 @@ class IgnitionConfig(BaseModel):
     
     @model_validator(mode="after")
     def check_source_paths(self) -> "IgnitionConfig":
-        """Validate that appropriate path is provided for source type."""
+        """Validate that appropriate path/coordinates are provided for source type."""
         if self.source_type == "grid" and self.grid_path is None:
             raise ValueError("grid_path required when source_type is 'grid'")
         if self.source_type in ("point", "shapefile") and self.point_path is None:
             raise ValueError("point_path required when source_type is 'point' or 'shapefile'")
+        if self.source_type == "coordinates" and len(self.coordinates) == 0:
+            raise ValueError("coordinates list required when source_type is 'coordinates'")
         return self
 
 
@@ -134,6 +152,25 @@ class StationColumnsConfig(BaseModel):
     aspect: str = "ASPECT"
 
 
+class StationCSVConfig(BaseModel):
+    """Configuration for parsing station CSV files (e.g., Alberta ACIS format)."""
+    
+    enabled: bool = Field(False, description="Use station CSV parser instead of standard format")
+    path: Path | None = Field(None, description="Path to station CSV file")
+    date_format: str | None = Field(None, description="Date format string (auto-detect if not set)")
+    station_name: str | None = Field(None, description="Station name filter")
+    
+    # Column name overrides (uses auto-detection if not set)
+    date_column: str | None = Field(None)
+    temp_column: str | None = Field(None)
+    rh_column: str | None = Field(None)
+    wind_speed_column: str | None = Field(None)
+    wind_dir_column: str | None = Field(None)
+    precip_column: str | None = Field(None)
+    ffmc_column: str | None = Field(None)
+    isi_column: str | None = Field(None)
+
+
 class ISIThresholdsConfig(BaseModel):
     """ISI threshold configuration."""
     
@@ -155,6 +192,20 @@ class WeatherConfig(BaseModel):
     spread_event_lambda: float = Field(3.76, ge=0)
     calculate_fwi: bool = Field(True, description="Calculate FWI from hourly weather if not present")
     fwi_latitude: float | None = Field(None, description="Latitude for FWI calculation (uses DEM center if not set)")
+    
+    # NEW: Station CSV parsing
+    station_csv: StationCSVConfig = Field(
+        default_factory=StationCSVConfig,
+        description="Configuration for parsing Alberta/Canada station CSV format"
+    )
+    
+    # NEW: Override weather values (useful for scenario testing)
+    override_temperature: float | None = Field(None, description="Override temperature (°C)")
+    override_relative_humidity: float | None = Field(None, description="Override RH (%)")
+    override_wind_speed: float | None = Field(None, description="Override wind speed (km/h)")
+    override_wind_direction: float | None = Field(None, description="Override wind direction (degrees)")
+    override_ffmc: float | None = Field(None, description="Override FFMC")
+    override_isi: float | None = Field(None, description="Override ISI")
 
 
 class FBPDefaultsConfig(BaseModel):
@@ -291,6 +342,95 @@ class SimulationConfig(BaseModel):
     default_start_hour: int = Field(12, ge=0, le=23, description="Default start hour if not specified")
 
 
+class PhysicsConfig(BaseModel):
+    """
+    Advanced physics module configuration.
+    
+    These settings control the enhanced physics modules in the JAX level-set
+    simulation (solar radiation, moisture lag, crown fire, etc.)
+    """
+    
+    # Module enable/disable
+    enable_solar_radiation: bool = Field(
+        False, description="Enable solar radiation and terrain-based fuel conditioning"
+    )
+    enable_moisture_lag: bool = Field(
+        False, description="Enable time-lagged fuel moisture dynamics"
+    )
+    enable_crown_fire: bool = Field(
+        False, description="Enable Van Wagner crown fire transition"
+    )
+    enable_terrain_wind: bool = Field(
+        False, description="Enable mass-conserving terrain wind solver"
+    )
+    enable_fire_atmosphere: bool = Field(
+        False, description="Enable fire-atmosphere coupling (indraft)"
+    )
+    
+    # Solar radiation parameters
+    solar_hours_back: int = Field(6, ge=1, le=24, description="Hours to integrate solar exposure")
+    solar_clear_sky_index: float = Field(0.8, ge=0, le=1, description="Clear sky index (0=overcast, 1=clear)")
+    
+    # Moisture lag parameters
+    moisture_asymmetry: float = Field(0.5, ge=0.1, le=1.0, description="Wetting rate vs drying rate")
+    moisture_fire_effect: bool = Field(True, description="Fire proximity affects moisture")
+    
+    # Crown fire parameters
+    default_canopy_base_height: float = Field(3.0, gt=0, description="Default CBH if not provided (m)")
+    default_canopy_bulk_density: float = Field(0.15, gt=0, description="Default CBD if not provided (kg/m³)")
+    default_foliar_moisture: float = Field(100.0, ge=50, le=200, description="Foliar moisture content (%)")
+    
+    # Wind solver parameters
+    wind_solver_iterations: int = Field(100, ge=10, description="Poisson solver iterations")
+    wind_ridge_speedup: float = Field(1.3, ge=1.0, le=2.0, description="Ridge wind speedup factor")
+    wind_valley_slowdown: float = Field(0.7, ge=0.3, le=1.0, description="Valley wind slowdown factor")
+    
+    # Fire-atmosphere coupling
+    indraft_coefficient: float = Field(0.3, ge=0, le=1.0, description="Indraft strength")
+    indraft_decay_distance: float = Field(100.0, gt=0, description="Indraft decay distance (m)")
+
+
+class DataSourceConfig(BaseModel):
+    """
+    Data source configuration for preprocessing pipeline.
+    
+    Specifies whether to use cloud data acquisition or local files.
+    """
+    
+    # Cloud data acquisition
+    use_cloud_data: bool = Field(False, description="Fetch data from cloud sources")
+    cloud_bbox: list[float] | None = Field(
+        None, 
+        description="Bounding box for cloud data [west, south, east, north] in WGS84"
+    )
+    cloud_datasets: list[str] = Field(
+        default_factory=lambda: ["dem", "landcover", "canopy_height"],
+        description="Datasets to fetch: dem, landcover, canopy_height, ecoregions, burned_area"
+    )
+    cloud_output_dir: Path | None = Field(None, description="Output directory for cloud data")
+    
+    # Fuel raster generation
+    create_fuel_from_landcover: bool = Field(
+        False, description="Generate FBP fuel raster from land cover"
+    )
+    
+    # Land cover to fuel mapping (ESA WorldCover class -> FBP fuel type)
+    landcover_fuel_mapping: dict[int, str] = Field(
+        default_factory=lambda: {
+            10: "C2",   # Tree cover
+            20: "C2",   # Shrubland
+            30: "O1a",  # Grassland
+            40: "M2",   # Cropland
+            50: "NF",   # Built-up
+            60: "NF",   # Bare/sparse
+            70: "NF",   # Snow/ice
+            80: "NF",   # Water
+            90: "O1a",  # Wetland
+        },
+        description="Mapping of land cover classes to FBP fuel types"
+    )
+
+
 class OutputConfig(BaseModel):
     """Output configuration."""
     
@@ -319,6 +459,8 @@ class IgnacioConfig(BaseModel):
     fbp: FBPConfig = Field(default_factory=FBPConfig)
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
+    physics: PhysicsConfig = Field(default_factory=PhysicsConfig)
+    data_source: DataSourceConfig = Field(default_factory=DataSourceConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     
     @field_validator("project", mode="before")

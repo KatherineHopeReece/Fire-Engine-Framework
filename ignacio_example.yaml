@@ -1,0 +1,265 @@
+# =============================================================================
+# IGNACIO - Fire Spread Modeling Framework
+# Example Configuration with All Options
+# =============================================================================
+# This configuration file demonstrates all available options including:
+# - Coordinate-based ignition points
+# - Station CSV weather parsing  
+# - Cloud data acquisition
+# - Enhanced physics modules
+# - Calibration settings
+# =============================================================================
+
+project:
+  name: "Bow Valley Fire Simulation"
+  description: "Example simulation near Banff, Alberta"
+  output_dir: "./output"
+  random_seed: 42
+
+# -----------------------------------------------------------------------------
+# Coordinate Reference System
+# -----------------------------------------------------------------------------
+crs:
+  working_crs: "EPSG:4326"  # WGS84 (geographic)
+  output_crs: "EPSG:4326"
+
+# -----------------------------------------------------------------------------
+# Terrain Data
+# -----------------------------------------------------------------------------
+terrain:
+  dem_path: "./data/dem_30m.tif"
+  slope_path: null  # Optional: will compute from DEM if null
+  aspect_path: null  # Optional: will compute from DEM if null
+
+# -----------------------------------------------------------------------------
+# Fuel Data
+# -----------------------------------------------------------------------------
+fuel:
+  source_type: "raster"
+  path: "./data/fuel_fbp.tif"
+  non_fuel_codes: [0, -1, 101, 102]
+  
+  # FBP fuel type lookup (raster value -> FBP code)
+  fuel_lookup:
+    1: "C1"   # Spruce-Lichen Woodland
+    2: "C2"   # Boreal Spruce
+    3: "C3"   # Mature Jack/Lodgepole Pine
+    4: "C4"   # Immature Jack/Lodgepole Pine
+    5: "C5"   # Red/White Pine
+    6: "C6"   # Conifer Plantation
+    7: "C7"   # Ponderosa Pine/Douglas Fir
+    8: "D1"   # Leafless Aspen
+    10: "M1"  # Boreal Mixedwood (leafless)
+    11: "M2"  # Boreal Mixedwood (green)
+    14: "S1"  # Jack/Lodgepole Pine Slash
+    17: "O1a" # Matted Grass
+    18: "O1b" # Standing Grass
+
+# -----------------------------------------------------------------------------
+# Ignition Configuration
+# -----------------------------------------------------------------------------
+ignition:
+  # Source type options: "grid", "shapefile", "point", "coordinates"
+  source_type: "coordinates"
+  
+  # Direct coordinate specification (used when source_type: "coordinates")
+  # Coordinates should be in WGS84 (lon, lat)
+  coordinates:
+    - x: -115.57
+      y: 51.18
+      name: "Primary Ignition"
+    - x: -115.55
+      y: 51.17
+      name: "Secondary Ignition"
+      time_offset: 60.0  # 60 minutes after simulation start
+  
+  # Alternative: Use shapefile
+  # source_type: "shapefile"
+  # point_path: "./data/ignition_points.shp"
+  
+  cause: "Lightning"
+  season: "Summer"
+  n_iterations: 1
+
+# -----------------------------------------------------------------------------
+# Weather Configuration
+# -----------------------------------------------------------------------------
+weather:
+  # Standard Ignacio format weather file
+  station_path: "./data/weather_hourly.csv"
+  
+  # Station CSV parsing (for Alberta ACIS format files like Banff_CS)
+  station_csv:
+    enabled: true
+    path: "./data/Banff_CS-20140201-20140531.csv"
+    # Column names are auto-detected, but can be overridden:
+    # date_column: "Date (Local Standard Time)"
+    # temp_column: "Air Temp. Avg. (?C)"
+  
+  # Weather overrides (useful for sensitivity analysis)
+  # These override values from the weather file
+  # override_temperature: 25.0
+  # override_relative_humidity: 30.0
+  # override_wind_speed: 20.0
+  # override_wind_direction: 270.0
+  # override_ffmc: 90.0
+  
+  # FWI calculation settings
+  calculate_fwi: true
+  fwi_latitude: 51.18
+  
+  # ISI thresholds for filtering spread events
+  isi_thresholds:
+    moderate: 0.0
+    high: 8.6
+    extreme: 12.6
+  filter_conditions: ["moderate", "high", "extreme"]
+
+# -----------------------------------------------------------------------------
+# Fire Behaviour Prediction (FBP) Settings
+# -----------------------------------------------------------------------------
+fbp:
+  defaults:
+    ffmc: 88.0
+    dmc: 30.0
+    dc: 200.0
+    bui: 70.0
+    isi: 10.0
+    fwi: 20.0
+  
+  fmc: 100.0           # Foliar moisture content (%)
+  curing: 85.0         # Grass curing (%)
+  slope_factor: 0.5    # Slope effect strength
+  backing_fraction: 0.2
+  length_to_breadth: 2.0
+  
+  wind:
+    measurement_height: 10.0
+    canopy_adjustment: true
+  
+  elevation_adjustment:
+    enabled: true
+    lapse_rate: 0.0065
+    reference_temp: 20.0
+    reference_rh: 30.0
+  
+  model:
+    engine: "fbp"  # Options: "fbp" (Canadian) or "rothermel" (US)
+    # Rothermel settings (if engine: "rothermel")
+    # rothermel_fuel_model_set: "40"
+    # midflame_wind_reduction: 0.4
+
+# -----------------------------------------------------------------------------
+# Simulation Parameters
+# -----------------------------------------------------------------------------
+simulation:
+  dt: 1.0                    # Time step (minutes)
+  max_duration: 1440         # Maximum duration (minutes = 24 hours)
+  n_vertices: 360            # Fire perimeter vertices
+  initial_radius: 30.0       # Initial fire radius (meters)
+  store_every: 10            # Save state every N steps
+  min_ros: 0.01              # Minimum ROS threshold (m/min)
+  interpolation_resolution: 30.0
+  
+  # Time-varying weather
+  time_varying_weather: true
+  start_datetime: "2014-05-15T14:00:00"  # ISO format
+  default_start_hour: 14
+
+# -----------------------------------------------------------------------------
+# Enhanced Physics Modules (JAX Level-Set)
+# -----------------------------------------------------------------------------
+physics:
+  # Module toggles
+  enable_solar_radiation: true   # Terrain-based fuel drying
+  enable_moisture_lag: true      # Time-lagged fuel moisture
+  enable_crown_fire: true        # Van Wagner crown fire transition
+  enable_terrain_wind: true      # Mass-conserving wind solver
+  enable_fire_atmosphere: false  # Fire-induced indraft (slower)
+  
+  # Solar radiation parameters
+  solar_hours_back: 6
+  solar_clear_sky_index: 0.8
+  
+  # Moisture lag parameters
+  moisture_asymmetry: 0.5
+  moisture_fire_effect: true
+  
+  # Crown fire parameters
+  default_canopy_base_height: 3.0   # meters
+  default_canopy_bulk_density: 0.15 # kg/m³
+  default_foliar_moisture: 100.0    # %
+  
+  # Wind solver parameters
+  wind_solver_iterations: 100
+  wind_ridge_speedup: 1.3
+  wind_valley_slowdown: 0.7
+  
+  # Fire-atmosphere coupling
+  indraft_coefficient: 0.3
+  indraft_decay_distance: 100.0
+
+# -----------------------------------------------------------------------------
+# Data Source Configuration (Preprocessing)
+# -----------------------------------------------------------------------------
+data_source:
+  # Cloud data acquisition
+  use_cloud_data: false
+  cloud_bbox: [-116.0, 51.0, -115.5, 51.5]  # [west, south, east, north]
+  cloud_datasets:
+    - dem
+    - landcover
+    - canopy_height
+  cloud_output_dir: "./data/cloud"
+  
+  # Fuel raster generation from land cover
+  create_fuel_from_landcover: false
+  
+  # Land cover to fuel mapping (ESA WorldCover -> FBP)
+  landcover_fuel_mapping:
+    10: "C2"   # Tree cover -> Boreal Spruce
+    20: "C2"   # Shrubland
+    30: "O1a"  # Grassland
+    40: "M2"   # Cropland -> Boreal Mixedwood
+    50: "NF"   # Built-up -> Non-fuel
+    60: "NF"   # Bare/sparse
+    70: "NF"   # Snow/ice
+    80: "NF"   # Water
+    90: "O1a"  # Wetland
+
+# -----------------------------------------------------------------------------
+# Calibration Settings
+# -----------------------------------------------------------------------------
+calibration:
+  enabled: false
+  use_jax_simulation: true
+  
+  # Parameters to calibrate
+  calibrate_wind: true
+  calibrate_ffmc: true
+  calibrate_ros_scale: false
+  
+  # Optimization settings
+  learning_rate: 0.1
+  n_iterations: 50
+  convergence_tol: 1.0e-6
+  
+  # Parameter bounds
+  wind_adj_bounds: [0.5, 2.0]
+  ffmc_adj_bounds: [-10.0, 10.0]
+
+# -----------------------------------------------------------------------------
+# Output Settings
+# -----------------------------------------------------------------------------
+output:
+  save_perimeters: true
+  save_ros_grids: true
+  save_weather_summary: true
+  save_ignition_summary: true
+  perimeter_format: "shapefile"  # Options: shapefile, geojson, geopackage
+  combine_perimeters: true
+  generate_plots: true
+  generate_animation: false
+  animation_fps: 10
+  log_level: "INFO"
+  # log_file: "./output/ignacio.log"
