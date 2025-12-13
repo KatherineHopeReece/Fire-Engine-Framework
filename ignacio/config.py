@@ -61,6 +61,11 @@ class FuelConfig(BaseModel):
         default_factory=dict,
         description="Mapping of numeric IDs to FBP fuel codes"
     )
+    rothermel_fuel_mapping: dict[int, int] = Field(
+        default_factory=dict,
+        description="Custom mapping of fuel codes to Rothermel fuel models. "
+                    "If empty, uses default FBP-to-Rothermel mapping."
+    )
 
 
 class IgnitionRule(BaseModel):
@@ -179,6 +184,26 @@ class ElevationAdjustmentConfig(BaseModel):
     reference_rh: float = Field(30.0, ge=0, le=100)
 
 
+class FireModelConfig(BaseModel):
+    """Fire behavior model selection."""
+    
+    engine: Literal["fbp", "rothermel"] = Field(
+        "fbp",
+        description="Fire spread model: 'fbp' (Canadian) or 'rothermel' (US/FARSITE)"
+    )
+    
+    # Rothermel-specific settings
+    rothermel_fuel_model_set: Literal["13", "40", "both"] = Field(
+        "both",
+        description="Fuel model set: '13' (Anderson), '40' (Scott-Burgan), or 'both'"
+    )
+    midflame_wind_reduction: float = Field(
+        0.4,
+        ge=0.1, le=1.0,
+        description="Factor to reduce 10m wind to midflame height"
+    )
+
+
 class FBPConfig(BaseModel):
     """Fire Behaviour Prediction configuration."""
     
@@ -192,6 +217,7 @@ class FBPConfig(BaseModel):
     elevation_adjustment: ElevationAdjustmentConfig = Field(
         default_factory=ElevationAdjustmentConfig
     )
+    model: FireModelConfig = Field(default_factory=FireModelConfig)
 
 
 class MarkerMethodConfig(BaseModel):

@@ -114,6 +114,17 @@ fuel:
     685: "M-1"
     690: "M-1"
     695: "M-1"
+  
+  # Custom mapping to Rothermel fuel models (optional)
+  # If using engine: rothermel, these override the default FBP-to-Rothermel mapping
+  # Uncomment and customize if needed:
+  # rothermel_fuel_mapping:
+  #   1: 8      # C-1 -> Compact timber litter
+  #   2: 10     # C-2 -> Timber understory
+  #   3: 9      # C-3 -> Hardwood litter
+  #   4: 10     # C-4 -> Timber understory
+  #   31: 1     # O-1a -> Short grass
+  #   32: 3     # O-1b -> Tall grass
 
 # --- Ignition from shapefile ---
 ignition:
@@ -172,6 +183,48 @@ fbp:
   slope_factor: 0.5
   backing_fraction: 0.2
   length_to_breadth: 2.0
+  
+  # Fire model selection
+  model:
+    engine: fbp                    # 'fbp' (Canadian) or 'rothermel' (US/FARSITE)
+    rothermel_fuel_model_set: both # '13' (Anderson), '40' (Scott-Burgan), or 'both'
+    midflame_wind_reduction: 0.4   # Factor to reduce 10m wind to midflame height
+
+# --- JAX Calibration Configuration ---
+# Enable this to use differentiable JAX backend for calibration
+calibration:
+  enabled: false            # Set to true to enable JAX calibration
+  use_jax_simulation: false # Set to true to use JAX for all simulations
+  
+  # Parameters to calibrate
+  calibrate_wind: true      # Wind speed adjustment factor
+  calibrate_ffmc: true      # Fuel moisture adjustment
+  calibrate_ros_scale: false
+  calibrate_backing: false
+  
+  # Initial values (starting point for optimization)
+  wind_adj_init: 1.0        # 1.0 = no adjustment
+  ffmc_adj_init: 0.0        # 0.0 = no adjustment
+  ros_scale_init: 1.0
+  backing_frac_init: 0.2
+  
+  # Calibrated values (populated after calibration, or set manually)
+  wind_adj: 1.0
+  ffmc_adj: 0.0
+  ros_scale: 1.0
+  backing_frac: 0.2
+  
+  # Optimization settings
+  learning_rate: 0.1        # Adam learning rate
+  n_iterations: 100         # Maximum iterations
+  convergence_tol: 0.000001 # Stop when loss change < tol
+  regularization: 0.01      # L2 regularization strength
+  
+  # Parameter bounds (min, max)
+  wind_adj_bounds: [0.3, 3.0]
+  ffmc_adj_bounds: [-15.0, 15.0]
+  ros_scale_bounds: [0.3, 3.0]
+  backing_frac_bounds: [0.05, 0.5]
 
 simulation:
   dt: 1.0

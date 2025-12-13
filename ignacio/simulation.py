@@ -167,6 +167,9 @@ def build_parameter_grid(
     """
     Build spatially-varying fire parameter grid.
     
+    Supports both Canadian FBP and US Rothermel fire spread models
+    based on config.fbp.model.engine setting.
+    
     Parameters
     ----------
     config : IgnacioConfig
@@ -188,9 +191,20 @@ def build_parameter_grid(
         Grid of ROS parameters over space and time.
     """
     from ignacio.weather import HourlyWeatherInterpolator
+    from ignacio.fire_models import (
+        compute_ros_grid_unified,
+        fwi_to_rothermel_moisture,
+        convert_fuel_grid_to_rothermel,
+    )
     
     fbp_config = config.fbp
     sim_config = config.simulation
+    
+    # Get fire model from config (default to FBP for backwards compatibility)
+    fire_model = getattr(fbp_config.model, 'engine', 'fbp') if hasattr(fbp_config, 'model') else 'fbp'
+    midflame_reduction = getattr(fbp_config.model, 'midflame_wind_reduction', 0.4) if hasattr(fbp_config, 'model') else 0.4
+    
+    logger.info(f"Using fire model: {fire_model.upper()}")
     
     if n_timesteps is None:
         n_timesteps = int(sim_config.max_duration / sim_config.dt)
@@ -286,11 +300,20 @@ def build_parameter_grid(
     
     logger.info(f"Building parameter grid: {n_timesteps} timesteps, {ny}x{nx} cells")
     
-    # Get unique fuel types
+    # Get unique fuel types and non-fuel codes
     unique_fuels = np.unique(fuel_grid)
-    non_fuel = config.fuel.non_fuel_codes
+    non_fuel = set(config.fuel.non_fuel_codes)
     
     logger.info(f"Unique fuel codes in grid: {sorted([int(f) for f in unique_fuels if np.isfinite(f)])}")
+    
+    # Convert FWI to Rothermel moisture if using Rothermel
+    if fire_model.lower() == "rothermel":
+        m_1hr, m_10hr, m_100hr = fwi_to_rothermel_moisture(
+            ffmc=weather_vals.get("ffmc", fbp_config.defaults.ffmc),
+            dmc=weather_vals.get("dmc", fbp_config.defaults.dmc),
+            dc=weather_vals.get("dc", fbp_config.defaults.dc),
+        )
+        logger.info(f"Rothermel moisture: 1hr={m_1hr:.3f}, 10hr={m_10hr:.3f}, 100hr={m_100hr:.3f}")
     
     # Build ROS grid for each timestep
     if use_time_varying:
@@ -305,39 +328,55 @@ def build_parameter_grid(
             # Get weather values for this timestep
             isi_t = weather_t.get("ISI", weather_vals["isi"])
             bui_t = weather_t.get("BUI", weather_vals["bui"])
+            wind_speed_t = weather_t.get("WS", weather_t.get("WIND_SPEED", weather_vals.get("wind_speed", 15.0)))
             wind_dir_t = weather_t.get("WD", weather_t.get("WIND_DIRECTION", weather_vals["wind_direction"]))
             temp_t = weather_t.get("TEMP", weather_t.get("TEMPERATURE", weather_vals["temperature"]))
             rh_t = weather_t.get("RH", weather_t.get("RELATIVE_HUMIDITY", weather_vals["relative_humidity"]))
+            ffmc_t = weather_t.get("FFMC", fbp_config.defaults.ffmc)
             
-            # Compute base ROS for each fuel type
-            base_ros = np.zeros((ny, nx), dtype=np.float32)
-            for fuel_id in unique_fuels:
-                if fuel_id in non_fuel or np.isnan(fuel_id):
-                    continue
+            # Compute ROS based on model
+            if fire_model.lower() == "fbp":
+                # FBP: compute per fuel type
+                base_ros = np.zeros((ny, nx), dtype=np.float32)
+                for fuel_id in unique_fuels:
+                    if fuel_id in non_fuel or np.isnan(fuel_id):
+                        continue
+                    
+                    ros = compute_ros(
+                        fuel_type=int(fuel_id),
+                        isi=isi_t,
+                        bui=bui_t,
+                        fmc=fbp_config.fmc,
+                        curing=fbp_config.curing,
+                        fuel_lookup=config.fuel.fuel_lookup,
+                    )
+                    mask = fuel_grid == fuel_id
+                    base_ros[mask] = ros
                 
-                ros = compute_ros(
-                    fuel_type=int(fuel_id),
-                    isi=isi_t,
-                    bui=bui_t,
-                    fmc=fbp_config.fmc,
-                    curing=fbp_config.curing,
-                    fuel_lookup=config.fuel.fuel_lookup,
+                # Apply slope correction
+                slope_factor = compute_slope_factor(
+                    terrain.slope_deg, terrain.aspect_deg, wind_dir_t,
+                    fbp_config.slope_factor,
                 )
-                mask = fuel_grid == fuel_id
-                base_ros[mask] = ros
+                ros_corrected = base_ros * slope_factor
+                
+            else:  # Rothermel
+                # Update moisture from FFMC if available
+                m_1hr_t, _, _ = fwi_to_rothermel_moisture(ffmc=ffmc_t)
+                
+                ros_corrected = compute_ros_grid_unified(
+                    fuel_grid, "rothermel",
+                    moisture_1hr=m_1hr_t,
+                    moisture_10hr=m_10hr,
+                    moisture_100hr=m_100hr,
+                    moisture_live=1.0,
+                    wind_speed=wind_speed_t,
+                    slope=terrain.slope_deg,
+                    non_fuel_codes=non_fuel,
+                    midflame_wind_reduction=midflame_reduction,
+                )
             
-            # Compute slope factor for this wind direction
-            slope_factor = compute_slope_factor(
-                terrain.slope_deg,
-                terrain.aspect_deg,
-                wind_dir_t,
-                fbp_config.slope_factor,
-            )
-            
-            # Apply slope correction
-            ros_corrected = base_ros * slope_factor
-            
-            # Elevation adjustment if enabled
+            # Elevation adjustment if enabled (both models)
             if fbp_config.elevation_adjustment.enabled:
                 from ignacio.terrain import compute_elevation_adjustment
                 
@@ -361,12 +400,12 @@ def build_parameter_grid(
             raz_arr[t] = np.radians((wind_dir_t + 180.0) % 360.0)
             
             if t % log_interval == 0:
-                hour = sim_time.hour
                 valid_ros = ros_corrected[ros_corrected > 0]
                 if len(valid_ros) > 0:
                     logger.debug(
-                        f"  t={t}: {sim_time.strftime('%H:%M')}, ISI={isi_t:.1f}, "
-                        f"WD={wind_dir_t:.0f}°, mean ROS={np.mean(valid_ros):.2f} m/min"
+                        f"  t={t}: {sim_time.strftime('%H:%M')}, "
+                        f"WS={wind_speed_t:.1f}, WD={wind_dir_t:.0f}°, "
+                        f"mean ROS={np.mean(valid_ros):.2f} m/min"
                     )
         
         # Log summary
@@ -377,46 +416,71 @@ def build_parameter_grid(
         
     else:
         # Static weather: compute once and broadcast
-        # Compute base ROS for each fuel type
-        ros_by_fuel = {}
-        for fuel_id in unique_fuels:
-            if fuel_id in non_fuel or np.isnan(fuel_id):
-                ros_by_fuel[fuel_id] = 0.0
-                continue
-            
-            ros = compute_ros(
-                fuel_type=int(fuel_id),
-                isi=weather_vals["isi"],
-                bui=weather_vals["bui"],
-                fmc=fbp_config.fmc,
-                curing=fbp_config.curing,
-                fuel_lookup=config.fuel.fuel_lookup,
-            )
-            ros_by_fuel[fuel_id] = ros
-            
-            if ros > 0:
-                fuel_name = config.fuel.fuel_lookup.get(int(fuel_id), f"ID-{int(fuel_id)}")
-                logger.debug(f"Fuel {fuel_name} (code {int(fuel_id)}): ROS = {ros:.2f} m/min")
-        
-        # Compute slope factor
         wind_dir = weather_vals["wind_direction"]
-        slope_factor = compute_slope_factor(
-            terrain.slope_deg,
-            terrain.aspect_deg,
-            wind_dir,
-            fbp_config.slope_factor,
-        )
+        wind_speed = weather_vals.get("wind_speed", 15.0)
         
-        # Build ROS grid
-        base_ros = np.zeros((ny, nx), dtype=np.float32)
-        for fuel_id, ros in ros_by_fuel.items():
-            if np.isnan(fuel_id):
-                continue
-            mask = fuel_grid == fuel_id
-            base_ros[mask] = ros
-        
-        # Apply slope correction
-        ros_corrected = base_ros * slope_factor
+        if fire_model.lower() == "fbp":
+            # Compute base ROS for each fuel type
+            ros_by_fuel = {}
+            for fuel_id in unique_fuels:
+                if fuel_id in non_fuel or np.isnan(fuel_id):
+                    ros_by_fuel[fuel_id] = 0.0
+                    continue
+                
+                ros = compute_ros(
+                    fuel_type=int(fuel_id),
+                    isi=weather_vals["isi"],
+                    bui=weather_vals["bui"],
+                    fmc=fbp_config.fmc,
+                    curing=fbp_config.curing,
+                    fuel_lookup=config.fuel.fuel_lookup,
+                )
+                ros_by_fuel[fuel_id] = ros
+                
+                if ros > 0:
+                    fuel_name = config.fuel.fuel_lookup.get(int(fuel_id), f"ID-{int(fuel_id)}")
+                    logger.debug(f"Fuel {fuel_name} (code {int(fuel_id)}): ROS = {ros:.2f} m/min")
+            
+            # Build ROS grid
+            base_ros = np.zeros((ny, nx), dtype=np.float32)
+            for fuel_id, ros in ros_by_fuel.items():
+                if np.isnan(fuel_id):
+                    continue
+                mask = fuel_grid == fuel_id
+                base_ros[mask] = ros
+            
+            # Apply slope correction
+            slope_factor = compute_slope_factor(
+                terrain.slope_deg, terrain.aspect_deg, wind_dir,
+                fbp_config.slope_factor,
+            )
+            ros_corrected = base_ros * slope_factor
+            
+        else:  # Rothermel
+            ros_corrected = compute_ros_grid_unified(
+                fuel_grid, "rothermel",
+                moisture_1hr=m_1hr,
+                moisture_10hr=m_10hr,
+                moisture_100hr=m_100hr,
+                moisture_live=1.0,
+                wind_speed=wind_speed,
+                slope=terrain.slope_deg,
+                non_fuel_codes=non_fuel,
+                midflame_wind_reduction=midflame_reduction,
+            )
+            
+            # Log some fuel-wise info
+            unique_roth = np.unique(convert_fuel_grid_to_rothermel(fuel_grid))
+            for roth_code in unique_roth:
+                if roth_code == 0:
+                    continue
+                from ignacio.jax_core.rothermel import FUEL_MODELS
+                if roth_code in FUEL_MODELS:
+                    fuel_name = FUEL_MODELS[roth_code].name
+                    mask = convert_fuel_grid_to_rothermel(fuel_grid) == roth_code
+                    mean_ros = np.mean(ros_corrected[mask]) if np.any(mask) else 0
+                    if mean_ros > 0:
+                        logger.debug(f"Rothermel {roth_code} ({fuel_name}): mean ROS = {mean_ros:.2f} m/min")
         
         # Elevation adjustment if enabled
         if fbp_config.elevation_adjustment.enabled:

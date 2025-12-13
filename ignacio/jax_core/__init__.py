@@ -160,6 +160,100 @@ from .visualization import (
     levelset_to_polygon,
 )
 
+# Spotting model
+from .spotting import (
+    SpottingParams,
+    compute_fire_intensity,
+    compute_spotting_probability_field,
+    apply_spotting,
+    evolve_phi_with_spotting,
+    simulate_fire_with_spotting,
+    calibrate_spotting_params,
+)
+
+# Rothermel model (US/FARSITE)
+from .rothermel import (
+    FuelModel,
+    FUEL_MODELS,
+    FUEL_MODELS_13,
+    FUEL_MODELS_40,
+    rothermel_ros,
+    compute_ros_rothermel_grid,
+    compute_ros_components_rothermel,
+)
+
+# Solar radiation and fuel conditioning
+from .solar_radiation import (
+    SunPosition,
+    compute_sun_position,
+    compute_solar_radiation,
+    compute_solar_exposure_index,
+    compute_hillshade,
+    FuelConditioningParams,
+    adjust_fuel_moisture_solar,
+    compute_fuel_conditioning,
+)
+
+# Fuel moisture lag (time integration)
+from .moisture_lag import (
+    MoistureState,
+    MoistureLagParams,
+    compute_equilibrium_moisture,
+    compute_equilibrium_moisture_grid,
+    initialize_moisture_state,
+    update_moisture_euler,
+    update_moisture_rk4,
+    evolve_moisture_with_fire,
+)
+
+# Crown fire transition (Van Wagner)
+from .crown_fire import (
+    CrownFireParams,
+    CrownFireState,
+    compute_byram_intensity,
+    compute_critical_intensity,
+    compute_critical_ros,
+    compute_crown_fraction_burned,
+    compute_total_ros_with_crown,
+    apply_crown_fire_to_grids,
+    update_crown_fire_state,
+)
+
+# Mass-conserving wind solver
+from .wind_solver import (
+    WindField,
+    WindSolverParams,
+    compute_terrain_parameters,
+    initialize_wind_field,
+    solve_wind_field,
+    apply_mass_conservation,
+    compute_divergence,
+    wind_field_to_ros_direction,
+)
+
+# Fire-atmosphere coupling
+from .fire_atmosphere import (
+    FireAtmosphereParams,
+    CoupledWindField,
+    compute_fire_front_location,
+    compute_fire_front_normal,
+    compute_indraft_velocity,
+    compute_plume_wind_reduction,
+    couple_wind_to_fire,
+    update_ros_for_coupling,
+    estimate_coupling_strength,
+)
+
+# Enhanced level-set simulation (integrates all physics)
+from .levelset_enhanced import (
+    EnhancedSimConfig,
+    EnhancedSimState,
+    EnhancedSimResult,
+    create_enhanced_grids,
+    simulate_fire_enhanced,
+    quick_simulate,
+)
+
 
 __all__ = [
     # New core (recommended)
@@ -256,4 +350,74 @@ __all__ = [
     "compute_metrics",
     "perimeter_to_polygon",
     "levelset_to_polygon",
+    # Spotting model
+    "SpottingParams",
+    "compute_fire_intensity",
+    "compute_spotting_probability_field",
+    "apply_spotting",
+    "evolve_phi_with_spotting",
+    "simulate_fire_with_spotting",
+    "calibrate_spotting_params",
+    # Rothermel model (US/FARSITE)
+    "FuelModel",
+    "FUEL_MODELS",
+    "FUEL_MODELS_13",
+    "FUEL_MODELS_40",
+    "rothermel_ros",
+    "compute_ros_rothermel_grid",
+    "compute_ros_components_rothermel",
+    # Solar radiation and fuel conditioning
+    "SunPosition",
+    "compute_sun_position",
+    "compute_solar_radiation",
+    "compute_solar_exposure_index",
+    "compute_hillshade",
+    "FuelConditioningParams",
+    "adjust_fuel_moisture_solar",
+    "compute_fuel_conditioning",
+    # Fuel moisture lag (time integration)
+    "MoistureState",
+    "MoistureLagParams",
+    "compute_equilibrium_moisture",
+    "compute_equilibrium_moisture_grid",
+    "initialize_moisture_state",
+    "update_moisture_euler",
+    "update_moisture_rk4",
+    "evolve_moisture_with_fire",
+    # Crown fire transition (Van Wagner)
+    "CrownFireParams",
+    "CrownFireState",
+    "compute_byram_intensity",
+    "compute_critical_intensity",
+    "compute_critical_ros",
+    "compute_crown_fraction_burned",
+    "compute_total_ros_with_crown",
+    "apply_crown_fire_to_grids",
+    "update_crown_fire_state",
+    # Mass-conserving wind solver
+    "WindField",
+    "WindSolverParams",
+    "compute_terrain_parameters",
+    "initialize_wind_field",
+    "solve_wind_field",
+    "apply_mass_conservation",
+    "compute_divergence",
+    "wind_field_to_ros_direction",
+    # Fire-atmosphere coupling
+    "FireAtmosphereParams",
+    "CoupledWindField",
+    "compute_fire_front_location",
+    "compute_fire_front_normal",
+    "compute_indraft_velocity",
+    "compute_plume_wind_reduction",
+    "couple_wind_to_fire",
+    "update_ros_for_coupling",
+    "estimate_coupling_strength",
+    # Enhanced level-set simulation
+    "EnhancedSimConfig",
+    "EnhancedSimState",
+    "EnhancedSimResult",
+    "create_enhanced_grids",
+    "simulate_fire_enhanced",
+    "quick_simulate",
 ]
