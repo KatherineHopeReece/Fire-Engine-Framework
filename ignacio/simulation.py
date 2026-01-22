@@ -20,7 +20,7 @@ from shapely.geometry import Polygon
 from ignacio.config import IgnacioConfig
 from ignacio.fbp import compute_ros, compute_ros_components
 from ignacio.ignition import IgnitionPoint, IgnitionSet, generate_ignitions, save_ignitions
-from ignacio.io import RasterData, read_raster, read_raster_int, write_raster, write_vector
+from ignacio.io import RasterData, read_raster, read_raster_int, write_raster, write_vector, read_vector, rasterize_geometries
 from ignacio.spread import (
     FireParameterGrid,
     FirePerimeterHistory,
@@ -228,36 +228,33 @@ def build_parameter_grid(
     
     # Get representative/initial weather
     weather_vals = get_representative_weather(weather, config)
+    # Combined fuel break mask for zero_ros treatment (can come from multiple breaks)
+    fuel_break_zero_ros_mask = None
     
     # Load fuel grid
     fuel_raster = read_raster_int(config.fuel.path)
     fuel_grid = fuel_raster.data
-    
+
     # Get coordinate arrays from terrain (this is our reference grid)
     x_coords, y_coords = terrain.get_coordinate_arrays()
     ny, nx = terrain.shape
-    
+
     logger.info(f"Terrain grid shape: {ny} x {nx}")
     logger.info(f"Fuel grid shape: {fuel_grid.shape[0]} x {fuel_grid.shape[1]}")
     logger.debug(f"Terrain CRS: {terrain.dem.crs}, Fuel CRS: {fuel_raster.crs}")
-    
+
     # Check if fuel grid matches terrain grid
     if fuel_grid.shape != terrain.shape:
         logger.warning(
             f"Fuel grid shape {fuel_grid.shape} differs from terrain {terrain.shape}. "
             f"Resampling fuel grid to match terrain."
         )
-        
-        # Use proper geospatial resampling via rasterio
         try:
             import rasterio
             from rasterio.enums import Resampling
             from rasterio.warp import reproject
-            
-            # Create destination array
+
             fuel_resampled = np.zeros((ny, nx), dtype=fuel_grid.dtype)
-            
-            # Reproject fuel grid to match terrain grid
             reproject(
                 source=fuel_grid,
                 destination=fuel_resampled,
@@ -265,18 +262,214 @@ def build_parameter_grid(
                 src_crs=fuel_raster.crs,
                 dst_transform=terrain.dem.transform,
                 dst_crs=terrain.dem.crs,
-                resampling=Resampling.nearest,  # Nearest neighbor for categorical data
+                resampling=Resampling.nearest,
             )
             fuel_grid = fuel_resampled
             logger.info(f"Reprojected fuel grid to shape: {fuel_grid.shape}")
-            
         except Exception as e:
             logger.warning(f"Rasterio reprojection failed: {e}, falling back to simple zoom")
-            # Fallback to simple zoom (may not align correctly)
             from scipy.ndimage import zoom
             zoom_factors = (ny / fuel_raster.data.shape[0], nx / fuel_raster.data.shape[1])
             fuel_grid = zoom(fuel_raster.data, zoom_factors, order=0)
             logger.info(f"Zoomed fuel grid to shape: {fuel_grid.shape}")
+
+    # Load and process fuel breaks if enabled
+    # Supports either:
+    #   - config.fuel_break (single FuelBreakConfig)
+    #   - config.fuel_breaks (list[FuelBreakConfig])
+    #   - config.fuel_break being a list/tuple (for forward-compat)
+    def _iter_fuel_breaks() -> list[Any]:
+        """Return a list of fuel break config objects (backward compatible).
+
+        NOTE: We intentionally return BOTH enabled and disabled entries so the
+        logs can confirm what was parsed from YAML.
+        """
+        out: list[Any] = []
+
+        # Backward-compatible single fuel_break (allow it to be a list/tuple too)
+        fb_single = getattr(config, "fuel_break", None)
+        if fb_single is not None:
+            if isinstance(fb_single, (list, tuple)):
+                out.extend(list(fb_single))
+            else:
+                out.append(fb_single)
+
+        # Preferred new API: additional fuel_breaks list
+        fb_list = getattr(config, "fuel_breaks", None)
+        if fb_list:
+            out.extend(list(fb_list))
+
+        return out
+
+    fuel_breaks = _iter_fuel_breaks()
+
+    if fuel_breaks:
+        enabled_ct = sum(1 for fb in fuel_breaks if getattr(fb, "enabled", False))
+        logger.info(
+            f"Found {len(fuel_breaks)} fuel break config(s) in config (enabled={enabled_ct}, disabled={len(fuel_breaks)-enabled_ct})"
+        )
+        for i, fb in enumerate(fuel_breaks, start=1):
+            logger.info(
+                f"  Fuel break {i}: enabled={getattr(fb, 'enabled', False)}, path={getattr(fb, 'path', None)}, treatment={getattr(fb, 'treatment_method', None)}, fuel_code={getattr(fb, 'fuel_code', None)}"
+            )
+
+    if fuel_breaks:
+        logger.info(f"Processing {len([fb for fb in fuel_breaks if getattr(fb, 'enabled', False)])} enabled fuel break layer(s)")
+
+        # Build a combined mask for zero_ros treatment across all breaks
+        fuel_break_zero_ros_mask = np.zeros((ny, nx), dtype=bool)
+
+        for fb_idx, fb_cfg in enumerate(fuel_breaks, start=1):
+            if not getattr(fb_cfg, "enabled", False):
+                logger.info(f"Skipping fuel break {fb_idx}: enabled=False")
+                continue
+            logger.info(f"Loading fuel break {fb_idx}/{len(fuel_breaks)} from: {fb_cfg.path}")
+
+            try:
+                fuel_break_path = Path(fb_cfg.path)
+
+                # -----------------------------------------------------------------
+                # Load break layer (raster or vector) and build mask on terrain grid
+                # -----------------------------------------------------------------
+                if fuel_break_path.suffix.lower() in [".tif", ".tiff"]:
+                    # Raster fuel break
+                    fuel_break_raster = read_raster_int(fuel_break_path)
+                    fuel_break_grid = fuel_break_raster.data
+
+                    # Resample if needed
+                    if fuel_break_grid.shape != (ny, nx):
+                        logger.info(
+                            f"Resampling fuel break {fb_idx} from {fuel_break_grid.shape} to {(ny, nx)}"
+                        )
+                        try:
+                            import rasterio
+                            from rasterio.enums import Resampling
+                            from rasterio.warp import reproject
+
+                            fuel_break_resampled = np.zeros((ny, nx), dtype=fuel_break_grid.dtype)
+                            reproject(
+                                source=fuel_break_grid,
+                                destination=fuel_break_resampled,
+                                src_transform=fuel_break_raster.transform,
+                                src_crs=fuel_break_raster.crs,
+                                dst_transform=terrain.dem.transform,
+                                dst_crs=terrain.dem.crs,
+                                resampling=Resampling.nearest,
+                            )
+                            fuel_break_grid = fuel_break_resampled
+                            logger.info(f"Reprojected fuel break {fb_idx} to shape: {fuel_break_grid.shape}")
+                        except Exception as e:
+                            logger.warning(f"Rasterio reprojection failed for fuel break {fb_idx}: {e}, using zoom")
+                            from scipy.ndimage import zoom
+
+                            zoom_factors = (
+                                ny / fuel_break_raster.data.shape[0],
+                                nx / fuel_break_raster.data.shape[1],
+                            )
+                            fuel_break_grid = zoom(fuel_break_raster.data, zoom_factors, order=0)
+                            logger.info(f"Zoomed fuel break {fb_idx} to shape: {fuel_break_grid.shape}")
+
+                    # Create mask for fuel break cells (any non-zero value)
+                    # NOTE: keep simple and robust; users can provide a binary break raster
+                    fb_mask = (fuel_break_grid > 0)
+
+                else:
+                    # Vector fuel break (shapefile, GeoJSON, etc.)
+                    fuel_break_gdf = read_vector(fuel_break_path, target_crs=terrain.dem.crs)
+                    logger.info(f"Loaded {len(fuel_break_gdf)} fuel break features (break {fb_idx})")
+
+                    # Buffer geometries if specified (buffer in meters; use projected CRS if needed)
+                    if fb_cfg.buffer_m is not None and fb_cfg.buffer_m > 0:
+                        logger.info(f"Buffering fuel break {fb_idx} by {fb_cfg.buffer_m} m")
+
+                        if terrain.dem.crs is not None:
+                            try:
+                                import pyproj
+
+                                crs_obj = pyproj.CRS.from_user_input(terrain.dem.crs)
+                                if crs_obj.is_geographic:
+                                    centroid = fuel_break_gdf.to_crs("EPSG:4326").geometry.unary_union.centroid
+                                    lon, lat = float(centroid.x), float(centroid.y)
+                                    utm_crs = pyproj.CRS.from_user_input(
+                                        f"+proj=utm +zone={(int((lon + 180) / 6) + 1)} +datum=WGS84 +units=m +no_defs"
+                                        + (" +south" if lat < 0 else "")
+                                    )
+
+                                    gdf_utm = fuel_break_gdf.to_crs(utm_crs)
+                                    gdf_utm.geometry = gdf_utm.geometry.buffer(fb_cfg.buffer_m)
+                                    fuel_break_gdf = gdf_utm.to_crs(terrain.dem.crs)
+                                else:
+                                    fuel_break_gdf.geometry = fuel_break_gdf.geometry.buffer(fb_cfg.buffer_m)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Fuel break {fb_idx} buffering CRS handling failed ({e}); buffering in layer CRS"
+                                )
+                                fuel_break_gdf.geometry = fuel_break_gdf.geometry.buffer(fb_cfg.buffer_m)
+                        else:
+                            fuel_break_gdf.geometry = fuel_break_gdf.geometry.buffer(fb_cfg.buffer_m)
+
+                    # Rasterize to match terrain grid
+                    logger.info(f"Rasterizing {len(fuel_break_gdf)} fuel break features (break {fb_idx})")
+                    fuel_break_grid = rasterize_geometries(
+                        fuel_break_gdf,
+                        reference=terrain.dem,
+                        value=1,
+                        fill=0,
+                        dtype="uint8",
+                        all_touched=fb_cfg.all_touched,
+                    )
+                    fb_mask = (fuel_break_grid == 1)
+
+                # -------------------------------------------------------------
+                # Apply preserve_non_fuel filter (per break)
+                # -------------------------------------------------------------
+                if getattr(fb_cfg, "preserve_non_fuel", False):
+                    non_fuel_mask = np.isin(fuel_grid, config.fuel.non_fuel_codes)
+                    fb_apply_mask = fb_mask & ~non_fuel_mask
+                else:
+                    fb_apply_mask = fb_mask
+
+                n_cells = int(np.sum(fb_apply_mask))
+                if n_cells <= 0:
+                    logger.warning(
+                        f"Fuel break {fb_idx}: no cells affected (check geometry/buffer and preserve_non_fuel setting)"
+                    )
+                    continue
+
+                # -------------------------------------------------------------
+                # Apply treatment
+                # -------------------------------------------------------------
+                treatment = getattr(fb_cfg, "treatment_method", "fuel_code")
+
+                if treatment == "fuel_code":
+                    # Overwrite fuel codes inside mask
+                    fuel_grid[fb_apply_mask] = fb_cfg.fuel_code
+                    logger.info(
+                        f"Applied fuel break {fb_idx} (fuel_code): {n_cells} cells set to fuel code {fb_cfg.fuel_code}"
+                    )
+
+                elif treatment == "zero_ros":
+                    # Accumulate into combined mask for later ROS forcing
+                    fuel_break_zero_ros_mask |= fb_apply_mask
+                    logger.info(
+                        f"Applied fuel break {fb_idx} (zero_ros): {n_cells} cells will have ROS forced to 0"
+                    )
+
+                else:
+                    logger.warning(
+                        f"Fuel break {fb_idx}: unknown treatment_method='{treatment}'. No treatment applied."
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to load/apply fuel break {fb_idx}: {e}")
+                logger.warning("Continuing simulation without this fuel break")
+                import traceback
+
+                logger.debug(traceback.format_exc())
+
+        # If no cells ended up in the zero_ros mask, disable it
+        if fuel_break_zero_ros_mask is not None and not np.any(fuel_break_zero_ros_mask):
+            fuel_break_zero_ros_mask = None
     
     # Initialize arrays
     ros_arr = np.zeros((n_timesteps, ny, nx), dtype=np.float32)
@@ -297,24 +490,24 @@ def build_parameter_grid(
         # Time-varying weather: compute ROS per timestep
         dt_minutes = sim_config.dt
         log_interval = max(1, n_timesteps // 5)  # Log ~5 times
-        
+
         for t in range(n_timesteps):
             sim_time = start_datetime + pd.Timedelta(minutes=t * dt_minutes)
             weather_t = interpolator.interpolate_at(sim_time)
-            
+
             # Get weather values for this timestep
             isi_t = weather_t.get("ISI", weather_vals["isi"])
             bui_t = weather_t.get("BUI", weather_vals["bui"])
             wind_dir_t = weather_t.get("WD", weather_t.get("WIND_DIRECTION", weather_vals["wind_direction"]))
             temp_t = weather_t.get("TEMP", weather_t.get("TEMPERATURE", weather_vals["temperature"]))
             rh_t = weather_t.get("RH", weather_t.get("RELATIVE_HUMIDITY", weather_vals["relative_humidity"]))
-            
+
             # Compute base ROS for each fuel type
             base_ros = np.zeros((ny, nx), dtype=np.float32)
             for fuel_id in unique_fuels:
                 if fuel_id in non_fuel or np.isnan(fuel_id):
                     continue
-                
+
                 ros = compute_ros(
                     fuel_type=int(fuel_id),
                     isi=isi_t,
@@ -325,7 +518,7 @@ def build_parameter_grid(
                 )
                 mask = fuel_grid == fuel_id
                 base_ros[mask] = ros
-            
+
             # Compute slope factor for this wind direction
             slope_factor = compute_slope_factor(
                 terrain.slope_deg,
@@ -333,14 +526,18 @@ def build_parameter_grid(
                 wind_dir_t,
                 fbp_config.slope_factor,
             )
-            
+
             # Apply slope correction
             ros_corrected = base_ros * slope_factor
-            
+
+            # Apply fuel breaks (zero_ros method) - combined mask across all breaks
+            if fuel_break_zero_ros_mask is not None:
+                ros_corrected[fuel_break_zero_ros_mask] = 0.0
+
             # Elevation adjustment if enabled
             if fbp_config.elevation_adjustment.enabled:
                 from ignacio.terrain import compute_elevation_adjustment
-                
+
                 elev_factor = compute_elevation_adjustment(
                     terrain.dem.data,
                     temp_t,
@@ -350,16 +547,16 @@ def build_parameter_grid(
                     fbp_config.elevation_adjustment.reference_rh,
                 )
                 ros_corrected *= elev_factor
-            
+
             # Compute other ROS components
             backing = fbp_config.backing_fraction
             lb_ratio = fbp_config.length_to_breadth
-            
+
             ros_arr[t] = ros_corrected
             bros_arr[t] = backing * ros_corrected
             fros_arr[t] = (ros_corrected + bros_arr[t]) / (2.0 * lb_ratio)
             raz_arr[t] = np.radians((wind_dir_t + 180.0) % 360.0)
-            
+
             if t % log_interval == 0:
                 hour = sim_time.hour
                 valid_ros = ros_corrected[ros_corrected > 0]
@@ -368,13 +565,13 @@ def build_parameter_grid(
                         f"  t={t}: {sim_time.strftime('%H:%M')}, ISI={isi_t:.1f}, "
                         f"WD={wind_dir_t:.0f}°, mean ROS={np.mean(valid_ros):.2f} m/min"
                     )
-        
+
         # Log summary
         logger.info(
             f"Time-varying weather: {start_datetime.strftime('%Y-%m-%d %H:%M')} to "
             f"{(start_datetime + pd.Timedelta(minutes=n_timesteps * dt_minutes)).strftime('%H:%M')}"
         )
-        
+
     else:
         # Static weather: compute once and broadcast
         # Compute base ROS for each fuel type
@@ -383,7 +580,7 @@ def build_parameter_grid(
             if fuel_id in non_fuel or np.isnan(fuel_id):
                 ros_by_fuel[fuel_id] = 0.0
                 continue
-            
+
             ros = compute_ros(
                 fuel_type=int(fuel_id),
                 isi=weather_vals["isi"],
@@ -393,11 +590,11 @@ def build_parameter_grid(
                 fuel_lookup=config.fuel.fuel_lookup,
             )
             ros_by_fuel[fuel_id] = ros
-            
+
             if ros > 0:
                 fuel_name = config.fuel.fuel_lookup.get(int(fuel_id), f"ID-{int(fuel_id)}")
                 logger.debug(f"Fuel {fuel_name} (code {int(fuel_id)}): ROS = {ros:.2f} m/min")
-        
+
         # Compute slope factor
         wind_dir = weather_vals["wind_direction"]
         slope_factor = compute_slope_factor(
@@ -406,7 +603,7 @@ def build_parameter_grid(
             wind_dir,
             fbp_config.slope_factor,
         )
-        
+
         # Build ROS grid
         base_ros = np.zeros((ny, nx), dtype=np.float32)
         for fuel_id, ros in ros_by_fuel.items():
@@ -414,14 +611,18 @@ def build_parameter_grid(
                 continue
             mask = fuel_grid == fuel_id
             base_ros[mask] = ros
-        
+
         # Apply slope correction
         ros_corrected = base_ros * slope_factor
-        
+
+        # Apply fuel breaks (zero_ros method) - combined mask across all breaks
+        if fuel_break_zero_ros_mask is not None:
+            ros_corrected[fuel_break_zero_ros_mask] = 0.0
+
         # Elevation adjustment if enabled
         if fbp_config.elevation_adjustment.enabled:
             from ignacio.terrain import compute_elevation_adjustment
-            
+
             elev_factor = compute_elevation_adjustment(
                 terrain.dem.data,
                 weather_vals["temperature"],
@@ -431,18 +632,18 @@ def build_parameter_grid(
                 fbp_config.elevation_adjustment.reference_rh,
             )
             ros_corrected *= elev_factor
-        
+
         # Compute other ROS components
         backing = fbp_config.backing_fraction
         lb_ratio = fbp_config.length_to_breadth
-        
+
         bros_base = backing * ros_corrected
         fros_base = (ros_corrected + bros_base) / (2.0 * lb_ratio)
-        
+
         # Rate of spread azimuth (direction fire spreads TO)
         raz_deg = (wind_dir + 180.0) % 360.0
         raz_rad = np.radians(raz_deg)
-        
+
         # Fill time dimension (constant weather)
         for t in range(n_timesteps):
             ros_arr[t] = ros_corrected

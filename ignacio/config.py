@@ -234,6 +234,49 @@ class OutputConfig(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field("INFO")
     log_file: Path | None = Field(None)
 
+class FuelBreakConfig(BaseModel):
+    """Optional Prometheus-style fuel break (fuel patch) configuration."""
+
+    enabled: bool = Field(False, description="Enable fuel break fuel-patch override")
+    path: Path | None = Field(None, description="Path to fuel break shapefile (line or polygon)")
+    fuel_code: int | None = Field(
+        None,
+        description="Fuel code to assign inside the break (must exist in your fuel LUT)"
+    )
+
+    treatment_method: Literal["fuel_code", "zero_ros"] = Field(
+        "fuel_code",
+        description=(
+            "How to apply the fuel break. 'fuel_code' overwrites cells with fuel_code; "
+            "'zero_ros' keeps fuel codes but forces ROS=0 in the break mask."
+        ),
+    )
+
+    all_touched: bool = Field(
+        True,
+        description="Rasterization option: burn any cell touched by geometry (good for roads)"
+    )
+    buffer_m: float | None = Field(
+        None,
+        ge=0,
+        description="Optional buffer distance (meters) if the break layer is a line"
+    )
+    preserve_non_fuel: bool = Field(
+        True,
+        description="If True, do not overwrite cells already classified as non-fuel"
+    )
+
+    @model_validator(mode="after")
+    def validate_break(self) -> "FuelBreakConfig":
+        if self.enabled:
+            if self.path is None:
+                raise ValueError("fuel_break.path is required when fuel_break.enabled is True")
+            if self.treatment_method == "fuel_code" and self.fuel_code is None:
+                raise ValueError(
+                    "fuel_break.fuel_code is required when fuel_break.enabled is True and treatment_method is 'fuel_code'"
+                )
+        return self
+
 
 class IgnacioConfig(BaseModel):
     """Root configuration model for Ignacio."""
@@ -247,6 +290,17 @@ class IgnacioConfig(BaseModel):
     fbp: FBPConfig = Field(default_factory=FBPConfig)
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    # Backward-compatible single fuel break (deprecated; prefer `fuel_breaks`)
+    fuel_break: FuelBreakConfig | None = Field(
+        default=None,
+        description="(Deprecated) Single fuel break. Prefer `fuel_breaks` list.",
+    )
+
+    # Preferred: list of fuel breaks
+    fuel_breaks: list[FuelBreakConfig] = Field(
+        default_factory=list,
+        description="List of fuel breaks to apply (processed in order).",
+    )
     
     @field_validator("project", mode="before")
     @classmethod
@@ -255,6 +309,17 @@ class IgnacioConfig(BaseModel):
         if isinstance(v, dict) and "output_dir" in v:
             v["output_dir"] = Path(v["output_dir"])
         return v
+
+    @field_validator("fuel_breaks", mode="before")
+    @classmethod
+    def _normalize_fuel_breaks(cls, v: Any) -> Any:
+        """Allow fuel_breaks to be provided as a single mapping or a list."""
+        if v is None:
+            return []
+        if isinstance(v, dict):
+            return [v]
+        return v
+
 
 
 # =============================================================================
@@ -376,6 +441,16 @@ def validate_paths(config: IgnacioConfig) -> list[str]:
     for name, path in required:
         if not Path(path).exists():
             errors.append(f"Required file not found: {name} = {path}")
+
+    # Fuel breaks (optional) - validate paths if enabled
+    if config.fuel_break is not None and config.fuel_break.enabled:
+        if config.fuel_break.path and not Path(config.fuel_break.path).exists():
+            errors.append(f"Fuel break file not found: fuel_break.path = {config.fuel_break.path}")
+
+    for i, fb in enumerate(getattr(config, "fuel_breaks", []) or [], start=1):
+        if getattr(fb, "enabled", False):
+            if fb.path and not Path(fb.path).exists():
+                errors.append(f"Fuel break file not found: fuel_breaks[{i}].path = {fb.path}")
     
     # Weather files - at least one should exist
     weather_found = False
