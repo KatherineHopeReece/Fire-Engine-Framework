@@ -21,7 +21,158 @@ from dataclasses import dataclass
 
 import numpy as np
 
+
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Marker maintenance + higher-order advection helpers (RK4)
+# =============================================================================
+
+def _closed_diffs_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Forward differences on a closed ring."""
+    dx = np.roll(x, -1) - x
+    dy = np.roll(y, -1) - y
+    return dx, dy
+
+
+def _segment_lengths_xy(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    dx, dy = _closed_diffs_xy(x, y)
+    return np.hypot(dx, dy)
+
+
+def _insert_delete_markers_by_spacing(
+    x: np.ndarray,
+    y: np.ndarray,
+    spacing: float,
+    insert_factor: float = 1.5,
+    delete_factor: float = 0.5,
+    max_n: int = 20000,
+    min_n: int = 50,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Maintain marker spacing on a closed ring by inserting/deleting vertices."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = x.size
+    if n < 4 or spacing <= 0:
+        return x, y
+
+    # ---- Insert pass ----
+    if n < max_n:
+        seg = _segment_lengths_xy(x, y)
+        new_x: list[float] = []
+        new_y: list[float] = []
+        for i in range(n):
+            x0, y0 = float(x[i]), float(y[i])
+            x1, y1 = float(x[(i + 1) % n]), float(y[(i + 1) % n])
+            new_x.append(x0)
+            new_y.append(y0)
+            if seg[i] > insert_factor * spacing:
+                new_x.append(0.5 * (x0 + x1))
+                new_y.append(0.5 * (y0 + y1))
+        x = np.asarray(new_x, dtype=float)
+        y = np.asarray(new_y, dtype=float)
+
+    # ---- Delete pass ----
+    n = x.size
+    if n > min_n:
+        seg = _segment_lengths_xy(x, y)
+        keep = np.ones(n, dtype=bool)
+        for i in range(n):
+            if keep.sum() <= min_n:
+                break
+            prev_i = (i - 1) % n
+            if seg[prev_i] < delete_factor * spacing and seg[i] < delete_factor * spacing:
+                keep[i] = False
+        x = x[keep]
+        y = y[keep]
+
+    return x, y
+
+
+def _smooth_ring_local_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    w: float = 0.10,
+    n_iter: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Very light local smoothing (Laplacian-like) for numerical noise only."""
+    if n_iter <= 0 or x.size < 4:
+        return x, y
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    for _ in range(n_iter):
+        x_prev = np.roll(x, 1)
+        x_next = np.roll(x, -1)
+        y_prev = np.roll(y, 1)
+        y_next = np.roll(y, -1)
+        x = (1 - w) * x + w * 0.5 * (x_prev + x_next)
+        y = (1 - w) * y + w * 0.5 * (y_prev + y_next)
+    return x, y
+
+
+def _rk4_step_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    dt: float,
+    vel_fn,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    RK4 step for marker advection: (x,y) -> (x_new,y_new).
+
+    The velocity function vel_fn(x, y) must resample the parameter grid
+    at arbitrary positions, not just the initial marker locations.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Current x positions of markers
+    y : np.ndarray
+        Current y positions of markers
+    dt : float
+        Time step
+    vel_fn : callable
+        Function that returns (vx, vy) = vel_fn(x, y) by sampling
+        the parameter grid at arbitrary (x,y) positions
+
+    Returns
+    -------
+    x_new : np.ndarray
+        Updated x positions
+    y_new : np.ndarray
+        Updated y positions
+
+    Notes
+    -----
+    Classic RK4 formula:
+        k1 = f(t, y)
+        k2 = f(t + dt/2, y + dt/2 * k1)
+        k3 = f(t + dt/2, y + dt/2 * k2)
+        k4 = f(t + dt, y + dt * k3)
+        y_new = y + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+    """
+    # Stage 1: velocity at current position
+    k1x, k1y = vel_fn(x, y)
+
+    # Stage 2: velocity at midpoint using k1
+    x_mid1 = x + 0.5 * dt * k1x
+    y_mid1 = y + 0.5 * dt * k1y
+    k2x, k2y = vel_fn(x_mid1, y_mid1)
+
+    # Stage 3: velocity at midpoint using k2
+    x_mid2 = x + 0.5 * dt * k2x
+    y_mid2 = y + 0.5 * dt * k2y
+    k3x, k3y = vel_fn(x_mid2, y_mid2)
+
+    # Stage 4: velocity at endpoint using k3
+    x_end = x + dt * k3x
+    y_end = y + dt * k3y
+    k4x, k4y = vel_fn(x_end, y_end)
+
+    # Weighted average
+    x_new = x + (dt / 6.0) * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+    y_new = y + (dt / 6.0) * (k1y + 2.0 * k2y + 2.0 * k3y + k4y)
+
+    return x_new, y_new
 
 
 # =============================================================================
@@ -646,6 +797,19 @@ def simulate_fire_spread(
     min_ros: float = 0.01,
     is_geographic: bool = False,
     center_latitude: float | None = None,
+    # --- New (optional) controls for higher-order advection ---
+    advection_integrator: str = "euler",  # "euler" (legacy) or "rk4"
+    resample_spacing: float | None = None,  # marker redistribution target spacing (coordinate units)
+    insert_factor: float = 1.5,
+    delete_factor: float = 0.5,
+    smoothing_weight: float = 0.10,
+    smoothing_iters: int = 1,
+    redistribute_every: int = 1,
+    max_substeps: int = 10,
+    max_move_fraction: float = 0.5,
+    # Backward-compatibility: older call sites may pass config objects here
+    sim_config: object | None = None,
+    **kwargs,
 ) -> FirePerimeterHistory:
     """
     Simulate fire spread from an ignition point.
@@ -680,11 +844,39 @@ def simulate_fire_spread(
     center_latitude : float, optional
         Center latitude for geographic conversion. Required if is_geographic=True.
         If None, uses y_ignition.
+
+    advection_integrator : str
+        "euler" (legacy) or "rk4" (fourth-order Runge–Kutta) for marker advection.
+    resample_spacing : float, optional
+        Target marker spacing in coordinate units for redistribution. If None, defaults to
+        `marker_epsilon` (in coordinate units) when redistribution is enabled.
+    redistribute_every : int
+        Apply redistribution every N steps (set 0/None to disable).
+    insert_factor, delete_factor : float
+        Threshold multipliers controlling when to insert/delete markers relative to target spacing.
+    smoothing_weight : float
+        Weight for very light local smoothing during redistribution (0 disables).
+    smoothing_iters : int
+        Number of light smoothing iterations (0 disables).
+    max_substeps : int
+        Maximum internal sub-steps for adaptive sub-stepping.
+    max_move_fraction : float
+        Fraction of target spacing allowed as max marker movement per sub-step.
+
+    sim_config : object, optional
+        Backward-compatibility parameter. Some call sites pass a simulation config object;
+        it is not used directly by this function.
+    **kwargs
+        Ignored extra keyword arguments for backward compatibility.
         
     Returns
     -------
     FirePerimeterHistory
         Evolution history of the fire perimeter.
+    
+    Notes
+    -----
+    `sim_config` and `**kwargs` are accepted for backward compatibility and ignored.
     """
     # Handle geographic coordinates
     if is_geographic:
@@ -732,45 +924,134 @@ def simulate_fire_spread(
     n_steps = min(max_steps, param_grid.nt)
     
     logger.info(f"Starting fire simulation: {n_steps} time steps, dt={dt} min")
+    logger.info(f"Advection integrator: {(advection_integrator or 'euler').strip().lower()}")
     if is_geographic:
         logger.debug(f"  Geographic mode: avg_meters_per_deg={avg_meters_per_deg:.0f}")
         logger.debug(f"  Initial radius: {initial_radius_deg:.6f} degrees ({initial_radius}m)")
-    
+
     for step in range(n_steps):
-        # Sample parameters at current vertex positions
-        # ROS values are in m/min from FBP calculations
-        ros, bros, fros, raz = param_grid.sample_at(step, x, y)
-        
-        # Convert ROS from m/min to coordinate units/min if geographic
-        if is_geographic:
-            # For each vertex, convert m/min to deg/min
-            # Use different scale factors for x and y components
-            # This is handled in evolve_perimeter_step by scaling the velocity
-            ros_deg = ros / avg_meters_per_deg
-            bros_deg = bros / avg_meters_per_deg
-            fros_deg = fros / avg_meters_per_deg
-            min_ros_deg = min_ros / avg_meters_per_deg
-        else:
-            ros_deg = ros
-            bros_deg = bros
-            fros_deg = fros
-            min_ros_deg = min_ros
-        
-        # Apply minimum ROS threshold
-        below_threshold = ros < min_ros  # Always compare in m/min
-        if np.all(below_threshold):
+        # ------------------------------------------------------------------
+        # Legacy Euler path (unchanged) samples only at the current vertices.
+        # RK4 path must sample the grid at intermediate stages to be correct.
+        # ------------------------------------------------------------------
+
+        # Always sample current ROS in m/min for extinguishment logic
+        ros_now_m, _, _, _ = param_grid.sample_at(step, x, y)
+        if np.all(ros_now_m < min_ros):
             logger.info(f"Fire extinguished at step {step} (all ROS below threshold)")
             break
-        
-        # Evolve perimeter (using coordinate-unit ROS values)
-        x_new, y_new = evolve_perimeter_step(
-            x, y, ros_deg, bros_deg, fros_deg, raz, dt,
-            use_markers=use_markers,
-            marker_epsilon=marker_epsilon_coord,
-        )
-        
-        x, y = x_new, y_new
-        
+
+        integrator = (advection_integrator or "euler").strip().lower()
+
+        # Shared velocity closure: resample the grid at arbitrary (x,y) positions.
+        # Used by both Euler and RK4 so that adaptive sub-stepping is consistent.
+        def _vel_from_grid(xq: np.ndarray, yq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            """Compute velocity at query points by sampling parameter grid (step-local)."""
+            # Sample ROS values at query positions (in m/min from FBP)
+            ros_m, bros_m, fros_m, raz = param_grid.sample_at(step, xq, yq)
+
+            # Extinction guard
+            if np.all(ros_m < min_ros):
+                return np.zeros_like(xq, dtype=float), np.zeros_like(yq, dtype=float)
+
+            # Convert ROS from m/min to coordinate units/min if geographic
+            if is_geographic:
+                ros_u = ros_m / avg_meters_per_deg
+                bros_u = bros_m / avg_meters_per_deg
+                fros_u = fros_m / avg_meters_per_deg
+            else:
+                ros_u = ros_m
+                bros_u = bros_m
+                fros_u = fros_m
+
+            # Compute Richards velocity using ellipse parameters
+            a, b, c, theta = ros_to_ellipse_params(ros_u, bros_u, fros_u, raz)
+            x_t, y_t = richards_velocity(xq, yq, a, b, c, theta)
+
+            # Marker method: freeze inactive vertices
+            if use_markers:
+                active = compute_active_vertices(xq, yq, marker_epsilon_coord)
+                x_t[~active] = 0.0
+                y_t[~active] = 0.0
+
+            return x_t, y_t
+
+        # Determine target spacing for adaptive sub-stepping and redistribution.
+        if resample_spacing is not None and resample_spacing > 0:
+            target_spacing = float(resample_spacing)
+        else:
+            target_spacing = float(marker_epsilon_coord) if marker_epsilon_coord > 0 else 0.0
+
+        if integrator == "rk4":
+            # Adaptive sub-stepping to limit movement per substep (RK4)
+            x_t0, y_t0 = _vel_from_grid(x, y)
+            speed0 = np.hypot(x_t0, y_t0)
+            vmax = float(np.max(speed0)) if speed0.size > 0 else 0.0
+
+            if target_spacing > 0 and vmax > 0:
+                max_move = max_move_fraction * target_spacing
+                nsub = int(np.ceil((vmax * dt) / max_move))
+                nsub = int(np.clip(nsub, 1, max_substeps))
+            else:
+                nsub = 1
+
+            subdt = dt / nsub
+
+            # Perform RK4 integration with sub-stepping
+            for isub in range(nsub):
+                x, y = _rk4_step_xy(x, y, subdt, _vel_from_grid)
+                if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+                    logger.warning(f"Non-finite coordinates at step {step}, substep {isub}")
+                    break
+
+        else:
+            # -------------------------------
+            # Explicit Euler with optional adaptive sub-stepping
+            # -------------------------------
+            x_t0, y_t0 = _vel_from_grid(x, y)
+            speed0 = np.hypot(x_t0, y_t0)
+            vmax = float(np.max(speed0)) if speed0.size > 0 else 0.0
+
+            if target_spacing > 0 and vmax > 0:
+                max_move = max_move_fraction * target_spacing
+                nsub = int(np.ceil((vmax * dt) / max_move))
+                nsub = int(np.clip(nsub, 1, max_substeps))
+            else:
+                nsub = 1
+
+            subdt = dt / nsub
+
+            for isub in range(nsub):
+                x_t, y_t = _vel_from_grid(x, y)
+                x = x + subdt * x_t
+                y = y + subdt * y_t
+
+                if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+                    logger.warning(f"Non-finite coordinates at step {step}, substep {isub}")
+                    break
+
+        # ------------------------------------------------------------------
+        # Marker redistribution + optional light smoothing (shared)
+        # Keeps a quasi-uniform discretization to improve curvature/tangent
+        # estimates and reduce numerical artifacts without shrinking the front.
+        # ------------------------------------------------------------------
+        if target_spacing > 0 and redistribute_every and int(redistribute_every) > 0:
+            if (step % int(redistribute_every)) == 0:
+                x, y = _insert_delete_markers_by_spacing(
+                    x,
+                    y,
+                    spacing=target_spacing,
+                    insert_factor=insert_factor,
+                    delete_factor=delete_factor,
+                    max_n=int(n_vertices * 10),
+                    min_n=int(n_vertices // 2),
+                )
+
+                # Very light local smoothing to suppress high-frequency numerical noise.
+                # Unlike Chaikin smoothing, this does not materially shrink the perimeter.
+                if smoothing_iters and int(smoothing_iters) > 0 and smoothing_weight and float(smoothing_weight) > 0:
+                    x, y = _smooth_ring_local_xy(x, y, w=float(smoothing_weight), n_iter=int(smoothing_iters))
+
         # Log progress at intervals
         if (step + 1) % 100 == 0:
             # Compute current fire extent
@@ -782,12 +1063,12 @@ def simulate_fire_spread(
                 logger.info(f"  Step {step+1}/{n_steps}: extent {x_extent_m:.0f}m x {y_extent_m:.0f}m")
             else:
                 logger.info(f"  Step {step+1}/{n_steps}: extent {x_extent:.0f}m x {y_extent:.0f}m")
-        
+
         # Store if requested
         if (step + 1) % store_every == 0:
             history.perimeters.append((x.copy(), y.copy()))
             history.times.append((step + 1) * dt)
-    
+
     logger.info(f"Simulation complete: {len(history.perimeters)} perimeters stored")
-    
+
     return history

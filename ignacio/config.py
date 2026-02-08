@@ -196,9 +196,117 @@ class FBPConfig(BaseModel):
 
 class MarkerMethodConfig(BaseModel):
     """Marker method configuration."""
-    
-    enabled: bool = Field(True)
-    epsilon: float = Field(1.0, gt=0)  # meters - offset for marker method
+
+    enabled: bool = Field(True, description="Enable marker method")
+
+    # Geometry / resolution knobs
+    epsilon: float = Field(1.0, gt=0, description="Marker epsilon (meters) used for activity + spacing heuristics")
+
+    # --- Post-processing / ring cleanup knobs ---
+    # Optional: if set, resample rings at a fixed spacing (in meters; same units as working CRS)
+    # If not provided, downstream code may fall back to epsilon.
+    resample_spacing: float | None = Field(
+        None,
+        gt=0,
+        description="Optional resampling spacing (meters). If None, may fall back to epsilon.",
+    )
+    chaikin_iters: int = Field(
+        1,
+        ge=0,
+        le=10,
+        description="Chaikin smoothing iterations for ring cleanup (0 disables).",
+    )
+
+    # --- In-solver marker advection + redistribution knobs ---
+    # These map to the Markersmethodchange block in spread.py. They are optional so existing configs work.
+    # Markersmethodchange: integrator selection (preferred over the legacy boolean)
+    advection_integrator: Literal["euler", "rk4"] = Field(
+        "rk4",
+        description="Marker advection integrator to use during spread simulation.",
+    )
+
+    # Backward-compatible legacy switch (if provided, it will override advection_integrator)
+    use_rk4_advection: bool | None = Field(
+        None,
+        description="(Deprecated) If set, overrides advection_integrator. True=rk4, False=euler.",
+    )
+    redistribute_markers: bool = Field(
+        True,
+        description="Insert/delete markers during simulation to maintain spacing.",
+    )
+    redistribute_every: int = Field(
+        1,
+        ge=1,
+        description="Redistribution frequency in timesteps (1 = every step).",
+    )
+
+    # If provided, overrides epsilon as the target spacing for redistribution.
+    target_spacing: float | None = Field(
+        None,
+        gt=0,
+        description="Optional target spacing (meters) for insertion/deletion. If None, uses epsilon.",
+    )
+
+    insert_factor: float = Field(
+        1.5,
+        gt=1.0,
+        description="Insert a marker when segment length > insert_factor * target_spacing.",
+    )
+    delete_factor: float = Field(
+        0.5,
+        gt=0,
+        lt=1.0,
+        description="Delete a marker when adjacent segments < delete_factor * target_spacing.",
+    )
+
+    # Very light numeric smoothing (NOT Chaikin) used during redistribution
+    smooth_weight: float = Field(
+        0.10,
+        ge=0,
+        le=0.5,
+        description="Local smoothing weight for in-solver marker noise reduction.",
+    )
+    smooth_iters: int = Field(
+        1,
+        ge=0,
+        le=10,
+        description="Local smoothing iterations for in-solver marker noise reduction.",
+    )
+
+    # Adaptive sub-stepping controls (limits movement per substep)
+    max_substeps: int = Field(
+        10,
+        ge=1,
+        le=100,
+        description="Maximum RK/Euler substeps per main timestep.",
+    )
+    max_move_fraction: float = Field(
+        0.5,
+        gt=0,
+        le=2.0,
+        description="Max movement per substep as a fraction of target spacing.",
+    )
+
+    @model_validator(mode="after")
+    def _normalize_spacing(self) -> "MarkerMethodConfig":
+        """Fill derived defaults and basic sanity checks."""
+        # Default spacing controls
+        if self.resample_spacing is None:
+            # Leave None; downstream may fall back to epsilon.
+            pass
+
+        if self.target_spacing is None:
+            self.target_spacing = float(self.epsilon)
+
+        # Markersmethodchange: if legacy boolean is explicitly set, map it to the new enum
+        if self.use_rk4_advection is not None:
+            self.advection_integrator = "rk4" if self.use_rk4_advection else "euler"
+
+        # Ensure factors make sense
+        if self.insert_factor <= self.delete_factor:
+            raise ValueError("marker_method.insert_factor must be > marker_method.delete_factor")
+
+        return self
 
 
 class SimulationConfig(BaseModel):

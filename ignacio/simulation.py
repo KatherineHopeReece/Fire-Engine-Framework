@@ -15,7 +15,13 @@ from typing import Any
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiPolygon
+
+# Optional Shapely validity helpers (Shapely 2.0+)
+try:
+    from shapely.validation import make_valid  # type: ignore
+except Exception:  # pragma: no cover
+    make_valid = None  # type: ignore
 
 from ignacio.config import IgnacioConfig
 from ignacio.fbp import compute_ros, compute_ros_components
@@ -36,7 +42,420 @@ from ignacio.weather import (
     save_fire_weather_list,
 )
 
+
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Perimeter Untangling / Cleaning Utilities
+# =============================================================================
+
+
+def _ensure_ring_closed(coords: list[tuple[float, float]], eps: float = 0.0) -> list[tuple[float, float]]:
+    """Ensure a coordinate ring is closed.
+
+    Parameters
+    ----------
+    coords : list of (x, y)
+        Ring coordinates.
+    eps : float
+        Optional tolerance: if the first/last points are within eps, snap closed.
+    """
+    if not coords:
+        return coords
+
+    x0, y0 = coords[0]
+    x1, y1 = coords[-1]
+
+    if (x0, y0) == (x1, y1):
+        return coords
+
+    if eps > 0.0:
+        if (abs(x0 - x1) <= eps) and (abs(y0 - y1) <= eps):
+            coords[-1] = (x0, y0)
+            return coords
+
+    coords.append((x0, y0))
+    return coords
+
+
+def _perim_to_ring(perim: Any) -> list[tuple[float, float]]:
+    """Convert a perimeter representation to a coordinate ring.
+
+    Supports:
+      - (x_array, y_array)
+      - Nx2 numpy arrays
+      - list of (x, y)
+    """
+    if perim is None:
+        return []
+
+    # (x, y) tuple
+    if isinstance(perim, tuple) and len(perim) == 2:
+        x, y = perim
+        x = np.asarray(x)
+        y = np.asarray(y)
+        if x.size == 0 or y.size == 0:
+            return []
+        return list(zip(x.tolist(), y.tolist()))
+
+    arr = np.asarray(perim)
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        return [(float(a), float(b)) for a, b in arr]
+
+    # list of tuples
+    if isinstance(perim, list) and perim and isinstance(perim[0], (tuple, list)) and len(perim[0]) == 2:
+        return [(float(a), float(b)) for a, b in perim]
+
+    return []
+
+
+
+def _ring_to_xy(ring: list[tuple[float, float]]) -> tuple[np.ndarray, np.ndarray]:
+    if not ring:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    xs = np.array([p[0] for p in ring], dtype=float)
+    ys = np.array([p[1] for p in ring], dtype=float)
+    return xs, ys
+
+
+# ---------------------------------------------------------------------------
+# Resampling and smoothing helpers for closed polygon rings
+# ---------------------------------------------------------------------------
+def _resample_ring_uniform(
+    ring: list[tuple[float, float]],
+    spacing: float,
+) -> list[tuple[float, float]]:
+    """Resample a closed ring to (approximately) uniform vertex spacing.
+
+    Parameters
+    ----------
+    ring : list[(x, y)]
+        Closed or open ring coordinates.
+    spacing : float
+        Target spacing in the same units as the coordinates.
+
+    Returns
+    -------
+    list[(x, y)]
+        Closed ring with resampled vertices.
+    """
+    if spacing <= 0 or not ring or len(ring) < 4:
+        return ring
+
+    pts = _ensure_ring_closed(list(ring), eps=0.0)
+    if len(pts) < 4:
+        return ring
+
+    # Drop duplicate last point for distance traversal
+    pts_open = pts[:-1]
+    n = len(pts_open)
+    if n < 3:
+        return ring
+
+    # Segment lengths
+    xs = np.array([p[0] for p in pts_open] + [pts_open[0][0]], dtype=float)
+    ys = np.array([p[1] for p in pts_open] + [pts_open[0][1]], dtype=float)
+    dx = np.diff(xs)
+    dy = np.diff(ys)
+    seglens = np.hypot(dx, dy)
+    perim = float(np.sum(seglens))
+
+    if not np.isfinite(perim) or perim <= 0:
+        return ring
+
+    # Number of samples (at least original count, but not crazy)
+    m = int(max(4, round(perim / spacing)))
+    # Cap to avoid runaway memory when spacing is tiny
+    m = min(m, 10000)
+
+    # Cumulative distance along ring
+    cum = np.concatenate([[0.0], np.cumsum(seglens)])
+    # Sample locations (exclude the endpoint == perim)
+    targets = np.linspace(0.0, perim, num=m, endpoint=False)
+
+    out: list[tuple[float, float]] = []
+    seg_i = 0
+    for d in targets:
+        while seg_i + 1 < len(cum) and cum[seg_i + 1] < d:
+            seg_i += 1
+        # Interpolate along segment seg_i
+        d0 = cum[seg_i]
+        d1 = cum[seg_i + 1]
+        if d1 <= d0:
+            t = 0.0
+        else:
+            t = (d - d0) / (d1 - d0)
+
+        x0, y0 = xs[seg_i], ys[seg_i]
+        x1, y1 = xs[seg_i + 1], ys[seg_i + 1]
+        out.append((float(x0 + t * (x1 - x0)), float(y0 + t * (y1 - y0))))
+
+    out = _ensure_ring_closed(out, eps=0.0)
+    return out
+
+
+def _chaikin_smooth_closed_ring(
+    ring: list[tuple[float, float]],
+    n_iter: int = 1,
+) -> list[tuple[float, float]]:
+    """Chaikin corner-cutting smoothing for a closed ring.
+
+    This preserves overall shape but reduces jaggedness by creating new points
+    along each edge. One iteration roughly doubles vertices.
+    """
+    if n_iter <= 0 or not ring or len(ring) < 4:
+        return ring
+
+    pts = _ensure_ring_closed(list(ring), eps=0.0)
+    pts_open = pts[:-1]
+    if len(pts_open) < 3:
+        return ring
+
+    for _ in range(n_iter):
+        new_pts: list[tuple[float, float]] = []
+        n = len(pts_open)
+        for i in range(n):
+            x0, y0 = pts_open[i]
+            x1, y1 = pts_open[(i + 1) % n]
+            # Q and R points
+            qx = 0.75 * x0 + 0.25 * x1
+            qy = 0.75 * y0 + 0.25 * y1
+            rx = 0.25 * x0 + 0.75 * x1
+            ry = 0.25 * y0 + 0.75 * y1
+            new_pts.append((float(qx), float(qy)))
+            new_pts.append((float(rx), float(ry)))
+        pts_open = new_pts
+
+    out = _ensure_ring_closed(pts_open, eps=0.0)
+    return out
+
+
+def _clean_polygon_from_ring(
+    ring: list[tuple[float, float]],
+    eps: float,
+    simplify_tol: float | None = None,
+    debug: dict[str, Any] | None = None,
+    resample_spacing: float | None = None,
+    chaikin_iters: int = 2,
+) -> Polygon | None:
+    """Attempt to remove self-intersections ("tangles") and jagged micro-edges.
+
+    This is a pragmatic implementation inspired by Prometheus' "untangling":
+    - enforce closure
+    - drop duplicate consecutive points
+    - repair self-intersections using make_valid() when available, otherwise buffer(0)
+    - keep the largest resulting polygon (outer perimeter)
+    - optional simplify() to reduce jaggedness
+
+    Notes
+    -----
+    This is a post-processing step. The most faithful implementation would
+    untangle after *each* marker advection step inside the spread solver.
+    """
+    if not ring or len(ring) < 4:
+        return None
+
+    if debug is not None:
+        debug.clear()
+        debug["n_vertices_in"] = len(ring)
+
+    # Remove consecutive duplicates (within eps)
+    cleaned: list[tuple[float, float]] = []
+    for (x, y) in ring:
+        if not cleaned:
+            cleaned.append((x, y))
+            continue
+        px, py = cleaned[-1]
+        if eps > 0.0 and (abs(x - px) <= eps) and (abs(y - py) <= eps):
+            continue
+        if (x, y) == (px, py):
+            continue
+        cleaned.append((x, y))
+
+    cleaned = _ensure_ring_closed(cleaned, eps=eps)
+    if len(cleaned) < 4:
+        return None
+
+    if debug is not None:
+        debug["n_vertices_cleaned"] = len(cleaned)
+
+    # -----------------------------------------------------------------
+    # Resample + smooth (Fix B)
+    # -----------------------------------------------------------------
+    # Jagged perimeters are often due to uneven vertex spacing, even when
+    # the polygon is topologically valid. Resampling to uniform spacing and
+    # applying a light Chaikin smoothing tends to be more effective than
+    # make_valid() for this case.
+    if resample_spacing is None:
+        # If caller didn't specify, use eps as a reasonable default when set.
+        resample_spacing = float(eps) if eps and eps > 0 else None
+
+    if resample_spacing is not None and resample_spacing > 0:
+        cleaned = _resample_ring_uniform(cleaned, spacing=float(resample_spacing))
+        if debug is not None:
+            debug["resample_spacing"] = float(resample_spacing)
+            debug["n_vertices_resampled"] = len(cleaned)
+
+    if chaikin_iters and chaikin_iters > 0:
+        cleaned = _chaikin_smooth_closed_ring(cleaned, n_iter=int(chaikin_iters))
+        if debug is not None:
+            debug["chaikin_iters"] = int(chaikin_iters)
+            debug["n_vertices_smoothed"] = len(cleaned)
+
+    poly = Polygon(cleaned)
+    # Track area before any untangling/repair for diagnostics
+    area_before = poly.area
+    if debug is not None:
+        debug["is_valid_before"] = bool(poly.is_valid)
+        debug["used_make_valid"] = False
+        debug["n_polygons_after_make_valid"] = 1
+        debug["make_valid_result_type"] = None
+    if poly.is_empty:
+        return None
+
+    # Repair invalid polygons (self-intersections, bow-ties)
+    if not poly.is_valid:
+        if make_valid is not None:
+            fixed = make_valid(poly)
+            if debug is not None:
+                debug["used_make_valid"] = True
+        else:
+            # Classic Shapely trick that often resolves self-intersections
+            fixed = poly.buffer(0)
+
+        if fixed.is_empty:
+            return None
+
+        if debug is not None:
+            debug["make_valid_result_type"] = type(fixed).__name__
+
+        if isinstance(fixed, Polygon):
+            poly = fixed
+        elif isinstance(fixed, MultiPolygon):
+            # Keep the largest component (outer perimeter)
+            if debug is not None:
+                debug["n_polygons_after_make_valid"] = len(list(fixed.geoms))
+            poly = max(list(fixed.geoms), key=lambda g: g.area)
+        else:
+            # GeometryCollection: keep the largest polygonal part
+            polys = [g for g in getattr(fixed, "geoms", []) if isinstance(g, Polygon)]
+            if debug is not None:
+                debug["n_polygons_after_make_valid"] = len(polys)
+            if not polys:
+                return None
+            poly = max(polys, key=lambda g: g.area)
+
+    # Log significant area change due to untangling/repair
+    try:
+        area_after = poly.area
+        if area_before > 0:
+            frac_change = (area_after - area_before) / area_before
+            if abs(frac_change) > 0.1:
+                logger.warning(
+                    f"Untangling changed area by {100.0 * frac_change:.1f}% "
+                    f"(before={area_before:.3f}, after={area_after:.3f})"
+                )
+    except Exception:
+        pass
+
+    # Optional simplification to reduce jaggedness (topology-preserving)
+    if simplify_tol is not None and simplify_tol > 0.0:
+        try:
+            poly_s = poly.simplify(simplify_tol, preserve_topology=True)
+            if isinstance(poly_s, Polygon) and (not poly_s.is_empty) and poly_s.area > 0:
+                poly = poly_s
+        except Exception:
+            pass
+
+    # Final sanity
+    if poly.is_empty or poly.area <= 0:
+        return None
+
+    return poly
+
+
+def _polygon_to_ring(poly: Polygon) -> list[tuple[float, float]]:
+    """Extract exterior ring coordinates from a polygon."""
+    coords = list(poly.exterior.coords)
+    # Shapely returns a closed ring already
+    return [(float(x), float(y)) for x, y in coords]
+
+
+def untangle_history_perimeters(
+    history: Any,
+    eps: float,
+    simplify_tol: float | None = None,
+) -> None:
+    """In-place untangling/cleaning of any perimeters stored on a FirePerimeterHistory.
+
+    Works with common representations:
+      - history.perimeters as list of (x, y) tuples
+      - history.perimeters as list of Nx2 arrays
+
+    If a perimeter cannot be repaired, it is left unchanged.
+    """
+    if history is None:
+        return
+
+    perims = getattr(history, "perimeters", None)
+    if not perims or not isinstance(perims, list):
+        return
+
+    new_perims: list[Any] = []
+    for step_idx, perim in enumerate(perims):
+        ring = _perim_to_ring(perim)
+        if not ring:
+            new_perims.append(perim)
+            continue
+
+        dbg: dict[str, Any] = {}
+        # Use eps both as a validity tolerance and a practical spacing scale.
+        # If eps is 0, resampling/smoothing will be skipped.
+        poly = _clean_polygon_from_ring(
+            ring,
+            eps=eps,
+            simplify_tol=simplify_tol,
+            debug=dbg,
+            # Markersmethodchange: allow independent resampling + smoothing controls via config when available
+            resample_spacing=(
+                float(getattr(getattr(history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
+                if hasattr(history, "marker_method")
+                else (eps if eps and eps > 0 else None)
+            ),
+            chaikin_iters=(
+                int(getattr(getattr(history, "marker_method", None), "chaikin_iters", 0) or 0)
+                if hasattr(history, "marker_method")
+                else 1
+            ),
+        )
+
+        # Prometheus-style debugging: step index, vertex counts, validity, make_valid output
+        try:
+            if dbg:
+                logger.debug(
+                    "Untangle step=%s n_vertices_in=%s n_vertices_cleaned=%s valid_before=%s "
+                    "used_make_valid=%s make_valid_type=%s n_polys=%s",
+                    step_idx,
+                    dbg.get("n_vertices_in"),
+                    dbg.get("n_vertices_cleaned"),
+                    dbg.get("is_valid_before"),
+                    dbg.get("used_make_valid"),
+                    dbg.get("make_valid_result_type"),
+                    dbg.get("n_polygons_after_make_valid"),
+                )
+        except Exception:
+            pass
+
+        if poly is None:
+            new_perims.append(perim)
+            continue
+
+        out_ring = _polygon_to_ring(poly)
+        x_out, y_out = _ring_to_xy(out_ring)
+        new_perims.append((x_out, y_out))
+
+    history.perimeters = new_perims
 
 
 # =============================================================================
@@ -68,14 +487,40 @@ class FireResult:
         x, y = self.history.get_final_perimeter()
         if len(x) == 0:
             return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
-        
-        # Close polygon
-        coords = list(zip(x, y))
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-        
-        polygon = Polygon(coords)
-        
+
+        # Build and clean polygon (repairs self-intersections / jagged micro-edges)
+        ring = list(zip(x.tolist(), y.tolist()))
+        ring = _ensure_ring_closed(ring, eps=0.0)
+
+        # Use marker epsilon as a reasonable default tolerance if available
+        eps = 0.0
+        try:
+            if self.history is not None and hasattr(self.history, "marker_epsilon"):
+                eps = float(getattr(self.history, "marker_epsilon") or 0.0)
+        except Exception:
+            eps = 0.0
+
+        # Simplify tolerance: small fraction of epsilon (or disabled)
+        simplify_tol = (0.5 * eps) if eps and eps > 0 else None
+
+        poly = _clean_polygon_from_ring(
+            ring,
+            eps=eps,
+            simplify_tol=simplify_tol,
+            # Markersmethodchange: allow independent resampling + smoothing controls via config when available
+            resample_spacing=(
+                float(getattr(getattr(self.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
+                if hasattr(self.history, "marker_method")
+                else (eps if eps and eps > 0 else None)
+            ),
+            chaikin_iters=(
+                int(getattr(getattr(self.history, "marker_method", None), "chaikin_iters", 0) or 0)
+                if hasattr(self.history, "marker_method")
+                else 1
+            ),
+        )
+        polygon = poly if poly is not None else Polygon(ring)
+
         # Create GeoDataFrame with source CRS
         gdf = gpd.GeoDataFrame(
             {
@@ -89,11 +534,11 @@ class FireResult:
             },
             crs=source_crs if source_crs else output_crs,
         )
-        
+
         # Reproject if needed
         if source_crs and source_crs != output_crs:
             gdf = gdf.to_crs(output_crs)
-        
+
         return gdf
 
 
@@ -719,6 +1164,13 @@ def simulate_single_fire(
             history=FirePerimeterHistory(perimeters=[], times=[]),
         )
     
+    # Markersmethodchange: log chosen advection integrator from YAML ("rk4" or "euler")
+    try:
+        logger.info(
+            f"Requested advection integrator: {getattr(sim_config.marker_method, 'advection_integrator', None)}"
+        )
+    except Exception:
+        pass
     # Run spread simulation
     history = simulate_fire_spread(
         param_grid=param_grid,
@@ -733,7 +1185,31 @@ def simulate_single_fire(
         min_ros=sim_config.min_ros,
         is_geographic=is_geographic,
         center_latitude=center_latitude,
+        # Markersmethodchange: pass SimulationConfig so spread.py can read simulation.marker_method.advection_integrator
+        sim_config=sim_config,
     )
+
+    # ---------------------------------------------------------------------
+    # Untangle / clean stored perimeters (post-processing)
+    # ---------------------------------------------------------------------
+    # NOTE: A more faithful Prometheus-style approach would untangle *each*
+    # timestep inside the spread solver. This post-pass still helps when
+    # jaggedness is driven by self-intersections / micro-loops.
+    if sim_config.marker_method.enabled:
+        eps = float(sim_config.marker_method.epsilon or 0.0)
+        simplify_tol = (0.5 * eps) if eps > 0 else None
+        try:
+            # Attach epsilon for downstream (e.g., get_final_polygon cleaner)
+            setattr(history, "marker_epsilon", eps)
+            # Markersmethodchange: attach marker_method so downstream cleaners can read optional tuning knobs
+            setattr(history, "marker_method", sim_config.marker_method)
+        except Exception:
+            pass
+
+        try:
+            untangle_history_perimeters(history, eps=eps, simplify_tol=simplify_tol)
+        except Exception as e:
+            logger.debug(f"Perimeter untangling failed (continuing without): {e}")
     
     # Compute final metrics
     final_area_ha = 0.0
