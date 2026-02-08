@@ -115,6 +115,25 @@ fuel:
     690: "M-1"
     695: "M-1"
 
+# --------------------------------------------------
+# Prometheus-style WUI / road fuel break
+# --------------------------------------------------
+fuel_breaks:
+  - enabled: true
+    path: /Users/Martyn/Desktop/ignacio/data/Fuel_Break_2.shp
+    buffer_m: 15.0
+    all_touched: true
+    preserve_non_fuel: true
+    treatment_method: fuel_code
+    fuel_code: 32
+  - enabled: true
+    path: /Users/Martyn/Desktop/ignacio/data/Road_FB.shp
+    buffer_m: 15.0
+    all_touched: true
+    preserve_non_fuel: true
+    treatment_method: zero_ros
+    fuel_code: 101
+
 # --- Ignition from shapefile ---
 ignition:
   source_type: "shapefile"
@@ -180,6 +199,17 @@ simulation:
   initial_radius: 10.0  # 10 meter initial fire
   store_every: 10
   min_ros: 0.01
+
+  marker_method:
+    enabled: true
+    epsilon: 10.0
+    resample_spacing: 5.0
+    chaikin_iters: 2
+    advection_integrator: "rk4" # options include "rk4", "euler" 
+    rk4_mode: "smooth"
+    redistribute_markers: true
+    redistribute_every: 1
+
   
   # Time-varying weather (uses hourly weather data)
   time_varying_weather: true
