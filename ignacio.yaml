@@ -120,14 +120,14 @@ fuel:
 # --------------------------------------------------
 fuel_breaks:
   - enabled: true
-    path: /Users/Martyn/Desktop/ignacio/data/Fuel_Break_2.shp
+    path: /path/to/Fuel_Break_1.shp
     buffer_m: 15.0
     all_touched: true
     preserve_non_fuel: true
     treatment_method: fuel_code
     fuel_code: 32
   - enabled: true
-    path: /Users/Martyn/Desktop/ignacio/data/Road_FB.shp
+    path: /path/to/fuel/break/2.shp
     buffer_m: 15.0
     all_touched: true
     preserve_non_fuel: true
