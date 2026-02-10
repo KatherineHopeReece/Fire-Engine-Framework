@@ -424,7 +424,7 @@ Time-varying weather requires hourly observations. If your data has gaps:
 
 ## License
 
-MIT License
+Apache License 2.0 License
 
 ## Contributing
 
