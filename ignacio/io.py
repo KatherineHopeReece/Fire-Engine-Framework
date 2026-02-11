@@ -525,3 +525,8 @@ def load_npz(path: str | Path) -> dict[str, np.ndarray]:
     
     with np.load(path) as data:
         return {key: data[key] for key in data.files}
+
+
+
+# Alias expected by simulation.py (backward compatibility)
+rasterize_geometries = rasterize_polygons
