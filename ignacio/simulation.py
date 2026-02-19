@@ -1210,6 +1210,101 @@ def simulate_single_fire(
             untangle_history_perimeters(history, eps=eps, simplify_tol=simplify_tol)
         except Exception as e:
             logger.debug(f"Perimeter untangling failed (continuing without): {e}")
+
+    # ---------------------------------------------------------------------
+    # Compute and attach per-timestep history stats (area/perimeter/ROS)
+    # ---------------------------------------------------------------------
+    # These stats are exported alongside the perimeter history to CSV.
+    try:
+        perims = getattr(history, "perimeters", None) or []
+        times = getattr(history, "times", None) or []
+        n = min(len(perims), len(times))
+
+        history_stats: list[dict[str, Any]] = []
+
+        # Helper to compute area/perimeter in meters (and ha) for both projected and geographic CRSs
+        def _area_perim_from_xy(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+            if x.size < 3 or y.size < 3:
+                return 0.0, 0.0
+
+            if is_geographic:
+                lat0 = float(center_latitude) if center_latitude is not None else float(np.nanmean(y))
+                lat_rad = np.radians(lat0)
+                meters_per_deg_lat = 111320.0
+                meters_per_deg_lon = 111320.0 * np.cos(lat_rad)
+
+                x_m = (x - float(np.nanmean(x))) * meters_per_deg_lon
+                y_m = (y - float(np.nanmean(y))) * meters_per_deg_lat
+
+                area_m2 = 0.5 * np.abs(np.sum(x_m * np.roll(y_m, -1) - np.roll(x_m, -1) * y_m))
+                dx = np.diff(np.append(x_m, x_m[0]))
+                dy = np.diff(np.append(y_m, y_m[0]))
+                perim_m = float(np.sum(np.hypot(dx, dy)))
+                return area_m2 / 10000.0, perim_m
+
+            # Projected
+            area_m2 = 0.5 * np.abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+            dx = np.diff(np.append(x, x[0]))
+            dy = np.diff(np.append(y, y[0]))
+            perim_m = float(np.sum(np.hypot(dx, dy)))
+            return area_m2 / 10000.0, perim_m
+
+        prev_area_ha = 0.0
+        dt_minutes = float(sim_config.dt)
+
+        for step in range(n):
+            perim = perims[step]
+            x_arr, y_arr = None, None
+
+            # Stored perimeters in this pipeline are typically (x_array, y_array)
+            if isinstance(perim, tuple) and len(perim) == 2:
+                x_arr = np.asarray(perim[0], dtype=float)
+                y_arr = np.asarray(perim[1], dtype=float)
+            else:
+                ring = _perim_to_ring(perim)
+                if ring:
+                    x_arr = np.asarray([p[0] for p in ring], dtype=float)
+                    y_arr = np.asarray([p[1] for p in ring], dtype=float)
+
+            if x_arr is None or y_arr is None or x_arr.size < 3:
+                history_stats.append({"area_ha": 0.0, "perim_m": 0.0, "darea_ha": 0.0, "ros_mean": 0.0, "ros_max": 0.0})
+                continue
+
+            area_ha, perim_m = _area_perim_from_xy(x_arr, y_arr)
+            darea_ha = max(0.0, area_ha - prev_area_ha)
+            prev_area_ha = area_ha
+
+            # Map stored time (minutes) -> parameter-grid timestep index
+            t_min = float(times[step])
+            t_idx = int(round(t_min / dt_minutes)) if dt_minutes > 0 else 0
+            t_idx = max(0, min(t_idx, int(param_grid.n_timesteps) - 1))
+
+            # Sample ROS along the perimeter vertices for this timestep
+            ros_mean = 0.0
+            ros_max = 0.0
+            try:
+                ros_s, _, _, _ = param_grid.sample_at(t_idx, x_arr, y_arr)
+                ros_s = np.asarray(ros_s, dtype=float)
+                ros_pos = ros_s[np.isfinite(ros_s) & (ros_s > 0)]
+                if ros_pos.size > 0:
+                    ros_mean = float(np.mean(ros_pos))
+                    ros_max = float(np.max(ros_pos))
+            except Exception:
+                pass
+
+            history_stats.append(
+                {
+                    "area_ha": float(area_ha),
+                    "perim_m": float(perim_m),
+                    "darea_ha": float(darea_ha),
+                    "ros_mean": float(ros_mean),
+                    "ros_max": float(ros_max),
+                }
+            )
+
+        setattr(history, "history_stats", history_stats)
+    except Exception as e:
+        logger.debug(f"Failed computing history stats (continuing without): {e}")
     
     # Compute final metrics
     final_area_ha = 0.0
@@ -1476,6 +1571,124 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
     return results
 
 
+
+# =============================================================================
+# Perimeter History Export Helper
+# =============================================================================
+
+def perimeter_history_to_gdf(
+    fire: FireResult,
+    fire_index: int,
+    output_crs: str,
+    source_crs: str | None = None,
+    start_datetime: str | None = None,
+) -> gpd.GeoDataFrame:
+    """Convert a single FireResult history into a GeoDataFrame.
+
+    Produces one row per stored perimeter, with time metadata so the
+    progression can be plotted/animated.
+
+    Notes
+    -----
+    - `fire.history.times` is assumed to be minutes since ignition/start.
+    - Use GeoPackage (GPKG) if you want robust datetime storage.
+    """
+    perims = getattr(fire.history, "perimeters", None) or []
+    times = getattr(fire.history, "times", None) or []
+
+    n = min(len(perims), len(times))
+    if n <= 0:
+        return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
+
+    # Optional absolute datetime column
+    start_ts = pd.Timestamp(start_datetime) if start_datetime else None
+
+    rows: list[dict[str, Any]] = []
+    for step in range(n):
+        perim = perims[step]
+        ring = _perim_to_ring(perim)
+        if not ring or len(ring) < 4:
+            continue
+
+        ring = _ensure_ring_closed(list(ring), eps=0.0)
+
+        # Clean/repair polygon using same utilities as final-perimeter export
+        eps = 0.0
+        try:
+            if fire.history is not None and hasattr(fire.history, "marker_epsilon"):
+                eps = float(getattr(fire.history, "marker_epsilon") or 0.0)
+        except Exception:
+            eps = 0.0
+
+        simplify_tol = (0.5 * eps) if eps and eps > 0 else None
+
+        poly = _clean_polygon_from_ring(
+            ring,
+            eps=eps,
+            simplify_tol=simplify_tol,
+            resample_spacing=(
+                float(getattr(getattr(fire.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
+                if hasattr(fire.history, "marker_method")
+                else (eps if eps and eps > 0 else None)
+            ),
+            chaikin_iters=(
+                int(getattr(getattr(fire.history, "marker_method", None), "chaikin_iters", 0) or 0)
+                if hasattr(fire.history, "marker_method")
+                else 1
+            ),
+        )
+        if poly is None:
+            poly = Polygon(ring)
+
+        if poly.is_empty or poly.area <= 0:
+            continue
+
+        # Optional per-timestep stats computed during simulation
+        area_ha = None
+        perim_m = None
+        darea_ha = None
+        ros_mean = None
+        ros_max = None
+        try:
+            stats_list = getattr(fire.history, "history_stats", None)
+            if isinstance(stats_list, list) and step < len(stats_list):
+                st = stats_list[step] or {}
+                area_ha = st.get("area_ha")
+                perim_m = st.get("perim_m")
+                darea_ha = st.get("darea_ha")
+                ros_mean = st.get("ros_mean")
+                ros_max = st.get("ros_max")
+        except Exception:
+            pass
+
+        t_min = float(times[step])
+        dt_abs = (start_ts + pd.Timedelta(minutes=t_min)) if start_ts is not None else None
+
+        rows.append(
+            {
+                "fire_index": int(fire_index),
+                "step": int(step),
+                "t_min": t_min,
+                "cause": fire.ignition.cause,
+                "season": fire.ignition.season,
+                "iteration": int(fire.ignition.iteration),
+                "datetime": dt_abs.to_pydatetime() if dt_abs is not None else None,
+                "area_ha": float(area_ha) if area_ha is not None else None,
+                "perim_m": float(perim_m) if perim_m is not None else None,
+                "darea_ha": float(darea_ha) if darea_ha is not None else None,
+                "ros_mean": float(ros_mean) if ros_mean is not None else None,
+                "ros_max": float(ros_max) if ros_max is not None else None,
+                "geometry": poly,
+            }
+        )
+
+    gdf = gpd.GeoDataFrame(rows, crs=source_crs if source_crs else output_crs)
+    if source_crs and source_crs != output_crs and len(gdf) > 0:
+        gdf = gdf.to_crs(output_crs)
+
+    return gdf
+
+
 def _save_results(
     results: SimulationResults,
     output_dir: Path,
@@ -1523,6 +1736,50 @@ def _save_results(
             
             write_vector(all_perimeters, combined_path)
             logger.info(f"Saved combined perimeters to {combined_path}")
+
+    # Save combined perimeter HISTORY (all fires, all stored timesteps)
+    # This enables plotting/animation of fire progression over time.
+    # NOTE: Shapefile has strict field limitations; prefer GPKG.
+    history_frames: list[gpd.GeoDataFrame] = []
+    for i, fire in enumerate(results.fires):
+        # Include fires even if the final area is small, as long as there is history
+        if not getattr(fire.history, "perimeters", None) or not getattr(fire.history, "times", None):
+            continue
+
+        gdf_h = perimeter_history_to_gdf(
+            fire,
+            fire_index=i,
+            output_crs=config.crs.output_crs,
+            source_crs=source_crs,
+            start_datetime=getattr(config.simulation, "start_datetime", None),
+        )
+        if len(gdf_h) > 0:
+            history_frames.append(gdf_h)
+
+    if history_frames:
+        gdf_hist_all = gpd.GeoDataFrame(pd.concat(history_frames, ignore_index=True), crs=config.crs.output_crs)
+
+        # Force a robust container for time fields regardless of perimeter_format
+        hist_path = output_dir / "all_perimeters_history.gpkg"
+        write_vector(gdf_hist_all, hist_path, driver="GPKG")
+        logger.info(f"Saved combined perimeter history to {hist_path}")
+
+        # Also save an attribute-only table for the history (no geometry).
+        # This is convenient when final perimeters are stored as Shapefiles.
+        hist_attr = gdf_hist_all.drop(columns=["geometry"], errors="ignore").copy()
+
+        # Make datetime CSV-friendly
+        if "datetime" in hist_attr.columns:
+            hist_attr["datetime"] = (
+                pd.to_datetime(hist_attr["datetime"], errors="coerce")
+                .dt.strftime("%Y-%m-%d %H:%M:%S")
+            )
+
+        hist_attr_path = output_dir / "all_perimeters_history_attributes.csv"
+        hist_attr.to_csv(hist_attr_path, index=False)
+        logger.info(f"Saved perimeter history attribute table to {hist_attr_path}")
+    else:
+        logger.info("No perimeter history to save (no stored perimeters/times found)")
     
     # Save summary CSV
     summary = results.get_summary()
