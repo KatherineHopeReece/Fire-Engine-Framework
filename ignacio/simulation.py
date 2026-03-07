@@ -488,38 +488,49 @@ class FireResult:
         if len(x) == 0:
             return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
 
-        # Build and clean polygon (repairs self-intersections / jagged micro-edges)
+        # Build polygon from perimeter coordinates
         ring = list(zip(x.tolist(), y.tolist()))
         ring = _ensure_ring_closed(ring, eps=0.0)
 
-        # Use marker epsilon as a reasonable default tolerance if available
-        eps = 0.0
-        try:
-            if self.history is not None and hasattr(self.history, "marker_epsilon"):
-                eps = float(getattr(self.history, "marker_epsilon") or 0.0)
-        except Exception:
+        # Level set contours are topologically clean — skip cleaning/smoothing
+        _is_level_set = (self.history is not None
+                         and not hasattr(self.history, "marker_method")
+                         and not hasattr(self.history, "marker_epsilon"))
+
+        if _is_level_set:
+            polygon = Polygon(ring)
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+                if isinstance(polygon, MultiPolygon):
+                    polygon = max(polygon.geoms, key=lambda g: g.area)
+        else:
+            # Use marker epsilon as a reasonable default tolerance if available
             eps = 0.0
+            try:
+                if self.history is not None and hasattr(self.history, "marker_epsilon"):
+                    eps = float(getattr(self.history, "marker_epsilon") or 0.0)
+            except Exception:
+                eps = 0.0
 
-        # Simplify tolerance: small fraction of epsilon (or disabled)
-        simplify_tol = (0.5 * eps) if eps and eps > 0 else None
+            # Simplify tolerance: small fraction of epsilon (or disabled)
+            simplify_tol = (0.5 * eps) if eps and eps > 0 else None
 
-        poly = _clean_polygon_from_ring(
-            ring,
-            eps=eps,
-            simplify_tol=simplify_tol,
-            # Markersmethodchange: allow independent resampling + smoothing controls via config when available
-            resample_spacing=(
-                float(getattr(getattr(self.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
-                if hasattr(self.history, "marker_method")
-                else (eps if eps and eps > 0 else None)
-            ),
-            chaikin_iters=(
-                int(getattr(getattr(self.history, "marker_method", None), "chaikin_iters", 0) or 0)
-                if hasattr(self.history, "marker_method")
-                else 1
-            ),
-        )
-        polygon = poly if poly is not None else Polygon(ring)
+            poly = _clean_polygon_from_ring(
+                ring,
+                eps=eps,
+                simplify_tol=simplify_tol,
+                resample_spacing=(
+                    float(getattr(getattr(self.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
+                    if hasattr(self.history, "marker_method")
+                    else (eps if eps and eps > 0 else None)
+                ),
+                chaikin_iters=(
+                    int(getattr(getattr(self.history, "marker_method", None), "chaikin_iters", 0) or 0)
+                    if hasattr(self.history, "marker_method")
+                    else 1
+                ),
+            )
+            polygon = poly if poly is not None else Polygon(ring)
 
         # Create GeoDataFrame with source CRS
         gdf = gpd.GeoDataFrame(
@@ -608,10 +619,11 @@ def build_parameter_grid(
     n_timesteps: int | None = None,
     hourly_data: pd.DataFrame | None = None,
     start_datetime: pd.Timestamp | None = None,
+    rng: np.random.Generator | None = None,
 ) -> FireParameterGrid:
     """
     Build spatially-varying fire parameter grid.
-    
+
     Parameters
     ----------
     config : IgnacioConfig
@@ -626,17 +638,22 @@ def build_parameter_grid(
         Hourly weather data for time-varying simulation.
     start_datetime : Timestamp, optional
         Simulation start time for time-varying weather.
-        
+    rng : numpy.random.Generator, optional
+        Random number generator (used for wind direction noise).
+
     Returns
     -------
     FireParameterGrid
         Grid of ROS parameters over space and time.
     """
     from ignacio.weather import HourlyWeatherInterpolator
-    
+
     fbp_config = config.fbp
     sim_config = config.simulation
-    
+
+    if rng is None:
+        rng = np.random.default_rng(config.project.random_seed)
+
     if n_timesteps is None:
         n_timesteps = int(sim_config.max_duration / sim_config.dt)
     
@@ -944,6 +961,10 @@ def build_parameter_grid(
             isi_t = weather_t.get("ISI", weather_vals["isi"])
             bui_t = weather_t.get("BUI", weather_vals["bui"])
             wind_dir_t = weather_t.get("WD", weather_t.get("WIND_DIRECTION", weather_vals["wind_direction"]))
+            # Add optional per-timestep wind direction noise
+            wd_noise_std = sim_config.wind_direction_noise_std
+            if wd_noise_std > 0:
+                wind_dir_t = (wind_dir_t + rng.normal(0, wd_noise_std)) % 360.0
             temp_t = weather_t.get("TEMP", weather_t.get("TEMPERATURE", weather_vals["temperature"]))
             rh_t = weather_t.get("RH", weather_t.get("RELATIVE_HUMIDITY", weather_vals["relative_humidity"]))
 
@@ -963,6 +984,17 @@ def build_parameter_grid(
                 )
                 mask = fuel_grid == fuel_id
                 base_ros[mask] = ros
+
+            # Apply terrain-aware wind deflection (spatially varying WD)
+            terrain_deflection = fbp_config.terrain_wind_deflection
+            if terrain_deflection > 0:
+                from ignacio.terrain import compute_terrain_wind_direction
+                wind_dir_grid_t = compute_terrain_wind_direction(
+                    wind_dir_t, terrain.aspect_deg, terrain.slope_deg,
+                    deflection_weight=terrain_deflection,
+                )
+            else:
+                wind_dir_grid_t = None
 
             # Compute slope factor for this wind direction
             slope_factor = compute_slope_factor(
@@ -993,14 +1025,29 @@ def build_parameter_grid(
                 )
                 ros_corrected *= elev_factor
 
-            # Compute other ROS components
-            backing = fbp_config.backing_fraction
-            lb_ratio = fbp_config.length_to_breadth
+            # Compute wind-dependent ellipse components (FBP Eq. 79-80)
+            from ignacio.fbp import (
+                compute_length_to_breadth_grid,
+                compute_backing_ros,
+                compute_flanking_ros,
+            )
+            wind_speed_t = weather_t.get("WS", weather_t.get("WIND_SPEED", weather_vals.get("wind_speed", 0.0)))
+            lb_t = compute_length_to_breadth_grid(
+                float(wind_speed_t),
+                fuel_grid=fuel_grid,
+                fuel_lookup=config.fuel.fuel_lookup,
+            )
+            bros_t = compute_backing_ros(ros_corrected, lb_t)
+            fros_t = compute_flanking_ros(ros_corrected, bros_t, lb_t)
 
             ros_arr[t] = ros_corrected
-            bros_arr[t] = backing * ros_corrected
-            fros_arr[t] = (ros_corrected + bros_arr[t]) / (2.0 * lb_ratio)
-            raz_arr[t] = np.radians((wind_dir_t + 180.0) % 360.0)
+            bros_arr[t] = bros_t
+            fros_arr[t] = fros_t
+            # Use spatially varying wind direction if terrain deflection is active
+            if wind_dir_grid_t is not None:
+                raz_arr[t] = np.radians((wind_dir_grid_t + 180.0) % 360.0)
+            else:
+                raz_arr[t] = np.radians((wind_dir_t + 180.0) % 360.0)
 
             if t % log_interval == 0:
                 hour = sim_time.hour
@@ -1078,12 +1125,20 @@ def build_parameter_grid(
             )
             ros_corrected *= elev_factor
 
-        # Compute other ROS components
-        backing = fbp_config.backing_fraction
-        lb_ratio = fbp_config.length_to_breadth
-
-        bros_base = backing * ros_corrected
-        fros_base = (ros_corrected + bros_base) / (2.0 * lb_ratio)
+        # Compute wind-dependent ellipse components (FBP Eq. 79-80)
+        from ignacio.fbp import (
+            compute_length_to_breadth_grid,
+            compute_backing_ros,
+            compute_flanking_ros,
+        )
+        wind_speed_val = weather_vals.get("wind_speed", 0.0)
+        lb_static = compute_length_to_breadth_grid(
+            float(wind_speed_val),
+            fuel_grid=fuel_grid,
+            fuel_lookup=config.fuel.fuel_lookup,
+        )
+        bros_base = compute_backing_ros(ros_corrected, lb_static)
+        fros_base = compute_flanking_ros(ros_corrected, bros_base, lb_static)
 
         # Rate of spread azimuth (direction fire spreads TO)
         raz_deg = (wind_dir + 180.0) % 360.0
@@ -1096,6 +1151,14 @@ def build_parameter_grid(
             fros_arr[t] = fros_base
             raz_arr[t] = raz_rad
     
+    # Apply global ROS scale factor
+    _ros_scale = getattr(config.fbp, "ros_scale", 1.0)
+    if _ros_scale != 1.0:
+        logger.info(f"Applying ros_scale={_ros_scale:.4f} to all ROS components")
+        ros_arr *= _ros_scale
+        bros_arr *= _ros_scale
+        fros_arr *= _ros_scale
+
     # Log ROS statistics (from first timestep)
     ros_t0 = ros_arr[0]
     valid_ros = ros_t0[ros_t0 > 0]
@@ -1172,44 +1235,81 @@ def simulate_single_fire(
     except Exception:
         pass
     # Run spread simulation
-    history = simulate_fire_spread(
-        param_grid=param_grid,
-        x_ignition=ignition.x,
-        y_ignition=ignition.y,
-        dt=sim_config.dt,
-        n_vertices=sim_config.n_vertices,
-        initial_radius=sim_config.initial_radius,
-        store_every=sim_config.store_every,
-        use_markers=sim_config.marker_method.enabled,
-        marker_epsilon=sim_config.marker_method.epsilon,
-        min_ros=sim_config.min_ros,
-        is_geographic=is_geographic,
-        center_latitude=center_latitude,
-        # Markersmethodchange: pass SimulationConfig so spread.py can read simulation.marker_method.advection_integrator
-        sim_config=sim_config,
-    )
+    if getattr(sim_config, "spread_method", "marker") == "levelset":
+        # ---- Level set solver (JAX) ----
+        from ignacio.levelset import simulate_fire_spread_levelset
+        ls = sim_config.level_set
+        history = simulate_fire_spread_levelset(
+            param_grid=param_grid,
+            x_ignition=ignition.x,
+            y_ignition=ignition.y,
+            dt=sim_config.dt,
+            initial_radius=sim_config.initial_radius,
+            store_every=sim_config.store_every,
+            min_ros=sim_config.min_ros,
+            is_geographic=is_geographic,
+            center_latitude=center_latitude,
+            cfl_factor=ls.cfl_factor,
+            reinit_interval=ls.reinit_interval,
+            reinit_iters=ls.reinit_iters,
+            narrow_band_width=ls.narrow_band_width,
+        )
+        # Level set contours are topologically clean — no untangling needed
+    else:
+        # ---- Marker method (legacy) ----
+        mm = sim_config.marker_method
+        # Resolve advection integrator: legacy flag overrides if set
+        if mm.use_rk4_advection is not None:
+            _integrator = "rk4" if mm.use_rk4_advection else "euler"
+        else:
+            _integrator = mm.advection_integrator or "euler"
 
-    # ---------------------------------------------------------------------
-    # Untangle / clean stored perimeters (post-processing)
-    # ---------------------------------------------------------------------
-    # NOTE: A more faithful Prometheus-style approach would untangle *each*
-    # timestep inside the spread solver. This post-pass still helps when
-    # jaggedness is driven by self-intersections / micro-loops.
-    if sim_config.marker_method.enabled:
-        eps = float(sim_config.marker_method.epsilon or 0.0)
-        simplify_tol = (0.5 * eps) if eps > 0 else None
-        try:
-            # Attach epsilon for downstream (e.g., get_final_polygon cleaner)
-            setattr(history, "marker_epsilon", eps)
-            # Markersmethodchange: attach marker_method so downstream cleaners can read optional tuning knobs
-            setattr(history, "marker_method", sim_config.marker_method)
-        except Exception:
-            pass
+        # Convert resample_spacing from meters to coordinate units (degrees) if geographic
+        _resample_spacing = None
+        if mm.resample_spacing is not None and mm.resample_spacing > 0:
+            if is_geographic and center_latitude is not None:
+                import math
+                _meters_per_deg_lat = 111_320.0
+                _meters_per_deg_lon = 111_320.0 * math.cos(math.radians(center_latitude))
+                _avg_m_per_deg = math.sqrt(_meters_per_deg_lat * _meters_per_deg_lon)
+                _resample_spacing = mm.resample_spacing / _avg_m_per_deg
+            else:
+                _resample_spacing = mm.resample_spacing
 
-        try:
-            untangle_history_perimeters(history, eps=eps, simplify_tol=simplify_tol)
-        except Exception as e:
-            logger.debug(f"Perimeter untangling failed (continuing without): {e}")
+        history = simulate_fire_spread(
+            param_grid=param_grid,
+            x_ignition=ignition.x,
+            y_ignition=ignition.y,
+            dt=sim_config.dt,
+            n_vertices=sim_config.n_vertices,
+            initial_radius=sim_config.initial_radius,
+            store_every=sim_config.store_every,
+            use_markers=mm.enabled,
+            marker_epsilon=mm.epsilon,
+            min_ros=sim_config.min_ros,
+            is_geographic=is_geographic,
+            center_latitude=center_latitude,
+            advection_integrator=_integrator,
+            resample_spacing=_resample_spacing,
+            redistribute_every=mm.redistribute_every if mm.redistribute_markers else 0,
+        )
+
+        # -----------------------------------------------------------------
+        # Untangle / clean stored perimeters (post-processing)
+        # -----------------------------------------------------------------
+        if sim_config.marker_method.enabled:
+            eps = float(sim_config.marker_method.epsilon or 0.0)
+            simplify_tol = (0.5 * eps) if eps > 0 else None
+            try:
+                setattr(history, "marker_epsilon", eps)
+                setattr(history, "marker_method", sim_config.marker_method)
+            except Exception:
+                pass
+
+            try:
+                untangle_history_perimeters(history, eps=eps, simplify_tol=simplify_tol)
+            except Exception as e:
+                logger.debug(f"Perimeter untangling failed (continuing without): {e}")
 
     # ---------------------------------------------------------------------
     # Compute and attach per-timestep history stats (area/perimeter/ROS)
@@ -1311,7 +1411,13 @@ def simulate_single_fire(
     final_perimeter_m = 0.0
     
     if history.perimeters:
-        x, y = history.get_final_perimeter()
+        # Find the last perimeter with enough vertices for area calculation
+        x, y = np.array([]), np.array([])
+        for pi in reversed(range(len(history.perimeters))):
+            _x, _y = history.perimeters[pi]
+            if len(_x) > 2:
+                x, y = _x, _y
+                break
         if len(x) > 2:
             if is_geographic:
                 # Convert from degrees to meters for area/perimeter calculation
@@ -1415,10 +1521,47 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
             hourly_data = None
     
     weather = process_fire_weather(config, rng)
-    
+
     if config.output.save_weather_summary:
         weather_path = output_dir / "fire_weather_list.csv"
         save_fire_weather_list(weather, weather_path)
+
+    # Enrich hourly data with FWI indices so time-varying simulation uses
+    # per-hour ISI (from hourly WS + daily FFMC) instead of a static value
+    if hourly_data is not None and "DATE" in hourly_data.columns:
+        daily_fwi = weather.records
+        if "FFMC" in daily_fwi.columns and "BUI" in daily_fwi.columns:
+            try:
+                from ignacio.fwi import calculate_isi
+                # Map daily FFMC and BUI to each hour by date
+                date_to_ffmc = dict(zip(
+                    pd.to_datetime(daily_fwi["DATE"]).dt.date,
+                    daily_fwi["FFMC"],
+                ))
+                date_to_bui = dict(zip(
+                    pd.to_datetime(daily_fwi["DATE"]).dt.date,
+                    daily_fwi["BUI"],
+                ))
+                h_dates = pd.to_datetime(hourly_data["DATE"]).dt.date if not hasattr(hourly_data["DATE"].iloc[0], 'date') else hourly_data["DATE"]
+                hourly_data["BUI"] = [date_to_bui.get(d, np.nan) for d in h_dates]
+                # Compute ISI from hourly wind speed + daily FFMC
+                ws_col = "WIND_SPEED" if "WIND_SPEED" in hourly_data.columns else "WS"
+                hourly_ffmc = np.array([date_to_ffmc.get(d, np.nan) for d in h_dates])
+                hourly_ws = hourly_data[ws_col].values.astype(float)
+                hourly_isi = np.array([
+                    calculate_isi(f, w) if np.isfinite(f) and np.isfinite(w) else np.nan
+                    for f, w in zip(hourly_ffmc, hourly_ws)
+                ])
+                hourly_data["ISI"] = hourly_isi
+                hourly_data["FFMC"] = hourly_ffmc
+                valid = np.isfinite(hourly_isi)
+                if valid.any():
+                    logger.info(
+                        f"Enriched hourly data with FWI: ISI range {hourly_isi[valid].min():.1f}-{hourly_isi[valid].max():.1f}, "
+                        f"mean {hourly_isi[valid].mean():.1f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not enrich hourly data with FWI: {e}")
     
     # Step 3: Generate ignitions
     logger.info("=" * 60)
@@ -1612,33 +1755,45 @@ def perimeter_history_to_gdf(
 
         ring = _ensure_ring_closed(list(ring), eps=0.0)
 
-        # Clean/repair polygon using same utilities as final-perimeter export
-        eps = 0.0
-        try:
-            if fire.history is not None and hasattr(fire.history, "marker_epsilon"):
-                eps = float(getattr(fire.history, "marker_epsilon") or 0.0)
-        except Exception:
-            eps = 0.0
+        # Level set contours are topologically clean — skip cleaning/smoothing
+        _is_level_set = (fire.history is not None
+                         and not hasattr(fire.history, "marker_method")
+                         and not hasattr(fire.history, "marker_epsilon"))
 
-        simplify_tol = (0.5 * eps) if eps and eps > 0 else None
-
-        poly = _clean_polygon_from_ring(
-            ring,
-            eps=eps,
-            simplify_tol=simplify_tol,
-            resample_spacing=(
-                float(getattr(getattr(fire.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
-                if hasattr(fire.history, "marker_method")
-                else (eps if eps and eps > 0 else None)
-            ),
-            chaikin_iters=(
-                int(getattr(getattr(fire.history, "marker_method", None), "chaikin_iters", 0) or 0)
-                if hasattr(fire.history, "marker_method")
-                else 1
-            ),
-        )
-        if poly is None:
+        if _is_level_set:
             poly = Polygon(ring)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+                if isinstance(poly, MultiPolygon):
+                    poly = max(poly.geoms, key=lambda g: g.area)
+        else:
+            # Clean/repair polygon using same utilities as final-perimeter export
+            eps = 0.0
+            try:
+                if fire.history is not None and hasattr(fire.history, "marker_epsilon"):
+                    eps = float(getattr(fire.history, "marker_epsilon") or 0.0)
+            except Exception:
+                eps = 0.0
+
+            simplify_tol = (0.5 * eps) if eps and eps > 0 else None
+
+            poly = _clean_polygon_from_ring(
+                ring,
+                eps=eps,
+                simplify_tol=simplify_tol,
+                resample_spacing=(
+                    float(getattr(getattr(fire.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
+                    if hasattr(fire.history, "marker_method")
+                    else (eps if eps and eps > 0 else None)
+                ),
+                chaikin_iters=(
+                    int(getattr(getattr(fire.history, "marker_method", None), "chaikin_iters", 0) or 0)
+                    if hasattr(fire.history, "marker_method")
+                    else 1
+                ),
+            )
+            if poly is None:
+                poly = Polygon(ring)
 
         if poly.is_empty or poly.area <= 0:
             continue

@@ -175,6 +175,173 @@ def _rk4_step_xy(
     return x_new, y_new
 
 
+def _euler_extrapolation_step_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    dt: float,
+    vel_fn,
+    n_base: int = 1,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Euler extrapolation (Richardson) step for marker advection.
+
+    Computes solutions with *n_base* and *2·n_base* forward Euler sub-steps,
+    then applies Richardson extrapolation to cancel the leading-order
+    truncation error, yielding second-order temporal accuracy from the
+    first-order Euler scheme.
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Current marker positions.
+    dt : float
+        Time step.
+    vel_fn : callable
+        Velocity function ``vel_fn(x, y) -> (vx, vy)``.
+    n_base : int
+        Number of sub-steps for the coarse solution.  The fine solution
+        uses ``2 * n_base`` sub-steps.
+
+    Returns
+    -------
+    x_new, y_new : np.ndarray
+        Extrapolated positions (second-order accurate).
+    error_est : float
+        Max pointwise error estimate ``||fine - coarse||_inf``, usable
+        for adaptive step-size control.
+    """
+    # Coarse solution: n_base Euler steps of size dt/n_base
+    x_c, y_c = x.copy(), y.copy()
+    dt_c = dt / n_base
+    for _ in range(n_base):
+        vx, vy = vel_fn(x_c, y_c)
+        x_c += dt_c * vx
+        y_c += dt_c * vy
+
+    # Fine solution: 2*n_base Euler steps of size dt/(2*n_base)
+    x_f, y_f = x.copy(), y.copy()
+    dt_f = dt / (2 * n_base)
+    for _ in range(2 * n_base):
+        vx, vy = vel_fn(x_f, y_f)
+        x_f += dt_f * vx
+        y_f += dt_f * vy
+
+    # Richardson extrapolation: 2*fine - coarse cancels O(dt) error
+    x_new = 2.0 * x_f - x_c
+    y_new = 2.0 * y_f - y_c
+
+    # Error estimate for adaptive step control: ||fine - coarse||_inf
+    error_est = float(np.max(np.hypot(x_f - x_c, y_f - y_c)))
+
+    return x_new, y_new, error_est
+
+
+def _implicit_newton_step_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    dt: float,
+    vel_fn,
+    max_iters: int = 3,
+    tol: float = 1e-10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Implicit Euler with Newton linearization for marker advection.
+
+    Solves the implicit system
+
+        z^{n+1} = z^n + dt · g(z^{n+1})
+
+    via Newton iteration.  At each iterate *m* the linearized system is:
+
+        [I − dt · J_g] δz = −r
+
+    where ``r = z^m − z^n − dt · g(z^m)`` is the residual and ``J_g``
+    is the Jacobian ``∂g/∂z`` approximated column-wise by finite
+    differences.  The initial guess is the forward-Euler predictor.
+
+    Because the method is unconditionally A-stable, no CFL sub-stepping
+    is required — a single call covers the full outer time step *dt*.
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Current marker positions (N markers each).
+    dt : float
+        Time step.
+    vel_fn : callable
+        Velocity function ``vel_fn(x, y) -> (vx, vy)``.
+    max_iters : int
+        Maximum Newton iterations (typically 2–4 suffice).
+    tol : float
+        Convergence tolerance on ``max|r|``.
+
+    Returns
+    -------
+    x_new, y_new : np.ndarray
+        Updated marker positions.
+    """
+    n = len(x)
+    N2 = 2 * n
+
+    def _pack(xv, yv):
+        z = np.empty(N2)
+        z[0::2] = xv
+        z[1::2] = yv
+        return z
+
+    def _unpack(z):
+        return z[0::2].copy(), z[1::2].copy()
+
+    def _g(z):
+        xq, yq = _unpack(z)
+        vx, vy = vel_fn(xq, yq)
+        return _pack(vx, vy)
+
+    z0 = _pack(x.copy(), y.copy())
+
+    # Predictor: forward Euler
+    g0 = _g(z0)
+    zm = z0 + dt * g0
+
+    # FD perturbation scale (relative to fire extent)
+    scale = max(float(np.ptp(x)), float(np.ptp(y)), 1e-10)
+    fd_eps = scale * 1e-7
+
+    for k in range(max_iters):
+        gm = _g(zm)
+
+        # Residual: r = z^m - z^n - dt * g(z^m)
+        r = zm - z0 - dt * gm
+        res_norm = float(np.max(np.abs(r)))
+        logger.debug(f"  Newton iter {k}: ||r||_inf = {res_norm:.3e}")
+
+        if res_norm < tol:
+            break
+
+        # Build A = [I - dt * J_g] column by column via finite differences.
+        # Column j: A[:,j] = e_j - dt * (g(z + eps*e_j) - g(z)) / eps
+        A = np.eye(N2)
+        for j in range(N2):
+            zp = zm.copy()
+            zp[j] += fd_eps
+            gp = _g(zp)
+            A[:, j] -= dt * (gp - gm) / fd_eps
+
+        # Solve [I - dt * J_g] δz = -r
+        try:
+            dz = np.linalg.solve(A, -r)
+        except np.linalg.LinAlgError:
+            logger.warning(
+                f"Newton linear solve failed at iteration {k}, "
+                f"using current iterate"
+            )
+            break
+
+        zm += dz
+
+    return _unpack(zm)
+
+
 # =============================================================================
 # Fire Parameter Grid
 # =============================================================================
@@ -261,7 +428,7 @@ class FireParameterGrid:
         """
         # Convert to fractional indices
         ix = (x - self.x_min) / self.dx
-        
+
         # Handle y-axis orientation
         if self.y_flipped:
             # y_coords[0] = y_max, y_coords[-1] = y_min
@@ -270,32 +437,42 @@ class FireParameterGrid:
         else:
             # Normal case: y_coords[0] = y_min
             iy = (y - self.y_min) / self.dy_abs
-        
+
+        # Guard against NaN coordinates (can arise during RK4 intermediate stages)
+        nan_mask = ~(np.isfinite(ix) & np.isfinite(iy))
+        if np.any(nan_mask):
+            ix = np.where(nan_mask, 0.0, ix)
+            iy = np.where(nan_mask, 0.0, iy)
+
         # Clamp to valid range
         ix = np.clip(ix, 0, self.nx - 1 - 1e-6)
         iy = np.clip(iy, 0, self.ny - 1 - 1e-6)
-        
+
         # Integer indices
         ix0 = np.floor(ix).astype(int)
         iy0 = np.floor(iy).astype(int)
         ix1 = np.clip(ix0 + 1, 0, self.nx - 1)
         iy1 = np.clip(iy0 + 1, 0, self.ny - 1)
-        
+
         # Fractional parts
         fx = ix - ix0
         fy = iy - iy0
-        
+
         # Corner values
         f00 = field[iy0, ix0]
         f10 = field[iy0, ix1]
         f01 = field[iy1, ix0]
         f11 = field[iy1, ix1]
-        
+
         # Bilinear interpolation
         f0 = f00 * (1 - fx) + f10 * fx
         f1 = f01 * (1 - fx) + f11 * fx
         result = f0 * (1 - fy) + f1 * fy
-        
+
+        # Zero out results for NaN input coordinates
+        if np.any(nan_mask):
+            result = np.where(nan_mask, 0.0, result)
+
         return result
     
     def sample_at(
@@ -569,9 +746,11 @@ def compute_turning_number(
     # Normalize to (-pi, pi]
     dtheta = (dtheta + np.pi) % (2.0 * np.pi) - np.pi
     
-    total_angle = np.sum(dtheta)
+    total_angle = np.nansum(dtheta)
+    if not np.isfinite(total_angle):
+        return 0
     turning_number = int(np.round(total_angle / (2.0 * np.pi)))
-    
+
     return turning_number
 
 
@@ -798,7 +977,7 @@ def simulate_fire_spread(
     is_geographic: bool = False,
     center_latitude: float | None = None,
     # --- New (optional) controls for higher-order advection ---
-    advection_integrator: str = "euler",  # "euler" (legacy) or "rk4"
+    advection_integrator: str = "euler",  # "euler" | "rk4" | "euler_extrap" | "implicit"
     resample_spacing: float | None = None,  # marker redistribution target spacing (coordinate units)
     insert_factor: float = 1.5,
     delete_factor: float = 0.5,
@@ -846,7 +1025,17 @@ def simulate_fire_spread(
         If None, uses y_ignition.
 
     advection_integrator : str
-        "euler" (legacy) or "rk4" (fourth-order Runge–Kutta) for marker advection.
+        Time integration scheme for marker advection.  Options:
+
+        - ``"euler"`` — forward Euler (first-order, legacy default).
+        - ``"rk4"`` — classical fourth-order Runge–Kutta.
+        - ``"euler_extrap"`` — Euler extrapolation (Richardson): runs
+          coarse and fine Euler solutions and extrapolates for
+          second-order accuracy with a free error estimate.
+        - ``"implicit"`` — backward Euler solved by Newton iteration
+          with finite-difference Jacobian.  Unconditionally A-stable
+          so no CFL sub-stepping is needed, but each step is more
+          expensive (O(N²) per Newton iteration for N markers).
     resample_spacing : float, optional
         Target marker spacing in coordinate units for redistribution. If None, defaults to
         `marker_epsilon` (in coordinate units) when redistribution is enabled.
@@ -982,6 +1171,9 @@ def simulate_fire_spread(
         else:
             target_spacing = float(marker_epsilon_coord) if marker_epsilon_coord > 0 else 0.0
 
+        # Save last known good coordinates for NaN recovery
+        x_prev, y_prev = x.copy(), y.copy()
+
         if integrator == "rk4":
             # Adaptive sub-stepping to limit movement per substep (RK4)
             x_t0, y_t0 = _vel_from_grid(x, y)
@@ -1001,8 +1193,51 @@ def simulate_fire_spread(
             for isub in range(nsub):
                 x, y = _rk4_step_xy(x, y, subdt, _vel_from_grid)
                 if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
-                    logger.warning(f"Non-finite coordinates at step {step}, substep {isub}")
+                    logger.warning(f"Non-finite coordinates at step {step}, substep {isub}, reverting to previous")
+                    x, y = x_prev.copy(), y_prev.copy()
                     break
+
+        elif integrator == "euler_extrap":
+            # ---------------------------------------------------------------
+            # Euler Extrapolation (Richardson): run coarse (n_base steps) and
+            # fine (2*n_base steps) Euler solutions, then extrapolate to
+            # cancel the O(dt) error, yielding 2nd-order accuracy.
+            # ---------------------------------------------------------------
+            x_t0, y_t0 = _vel_from_grid(x, y)
+            speed0 = np.hypot(x_t0, y_t0)
+            vmax = float(np.max(speed0)) if speed0.size > 0 else 0.0
+
+            if target_spacing > 0 and vmax > 0:
+                max_move = max_move_fraction * target_spacing
+                n_base = int(np.ceil((vmax * dt) / max_move))
+                n_base = int(np.clip(n_base, 1, max_substeps))
+            else:
+                n_base = 1
+
+            x, y, ee_err = _euler_extrapolation_step_xy(
+                x, y, dt, _vel_from_grid, n_base,
+            )
+
+            if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+                logger.warning(
+                    f"Non-finite coordinates at step {step} (euler_extrap), "
+                    f"reverting to previous"
+                )
+                x, y = x_prev.copy(), y_prev.copy()
+
+        elif integrator == "implicit":
+            # ---------------------------------------------------------------
+            # Implicit Euler with Newton linearization — unconditionally
+            # stable, no CFL sub-stepping required.
+            # ---------------------------------------------------------------
+            x, y = _implicit_newton_step_xy(x, y, dt, _vel_from_grid)
+
+            if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+                logger.warning(
+                    f"Non-finite coordinates at step {step} (implicit newton), "
+                    f"reverting to previous"
+                )
+                x, y = x_prev.copy(), y_prev.copy()
 
         else:
             # -------------------------------
@@ -1027,7 +1262,8 @@ def simulate_fire_spread(
                 y = y + subdt * y_t
 
                 if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
-                    logger.warning(f"Non-finite coordinates at step {step}, substep {isub}")
+                    logger.warning(f"Non-finite coordinates at step {step}, substep {isub}, reverting to previous")
+                    x, y = x_prev.copy(), y_prev.copy()
                     break
 
         # ------------------------------------------------------------------
@@ -1072,3 +1308,370 @@ def simulate_fire_spread(
     logger.info(f"Simulation complete: {len(history.perimeters)} perimeters stored")
 
     return history
+
+
+# =============================================================================
+# JAX-differentiable marker advection
+# =============================================================================
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from functools import partial as _jax_partial
+
+    _HAS_JAX = True
+except ImportError:
+    _HAS_JAX = False
+
+if _HAS_JAX:
+
+    _EPS_JAX = 1e-12
+
+    # -----------------------------------------------------------------
+    # JAX utility functions (bilinear sampling, spatial derivatives,
+    # Richards velocity) — differentiable building blocks.
+    # -----------------------------------------------------------------
+
+    def _jax_bilinear_sample(
+        field: jnp.ndarray,
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        x0: float,
+        y0: float,
+        dx: float,
+        dy: float,
+    ) -> jnp.ndarray:
+        """
+        Bilinear interpolation of a 2D field at arbitrary (x, y).
+
+        Parameters
+        ----------
+        field : jnp.ndarray
+            2D grid (ny, nx).
+        x, y : jnp.ndarray
+            Query coordinates (1D, N markers).
+        x0, y0 : float
+            Grid origin (x_coords[0], y_coords[0]).
+        dx, dy : float
+            Grid spacing.  *dy* may be negative for descending y-axis.
+        """
+        ny, nx = field.shape
+
+        ix = (x - x0) / dx
+        iy = (y - y0) / dy
+
+        ix = jnp.clip(ix, 0.0, nx - 1 - 1e-6)
+        iy = jnp.clip(iy, 0.0, ny - 1 - 1e-6)
+
+        ix0 = jnp.floor(ix).astype(jnp.int32)
+        iy0 = jnp.floor(iy).astype(jnp.int32)
+        ix1 = jnp.minimum(ix0 + 1, nx - 1)
+        iy1 = jnp.minimum(iy0 + 1, ny - 1)
+
+        fx = ix - ix0
+        fy = iy - iy0
+
+        f00 = field[iy0, ix0]
+        f10 = field[iy0, ix1]
+        f01 = field[iy1, ix0]
+        f11 = field[iy1, ix1]
+
+        return (f00 * (1 - fx) + f10 * fx) * (1 - fy) + \
+               (f01 * (1 - fx) + f11 * fx) * fy
+
+    def _jax_spatial_derivatives(
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Normalized central differences on a closed marker ring."""
+        x_s = (jnp.roll(x, -1) - jnp.roll(x, 1)) / 2.0
+        y_s = (jnp.roll(y, -1) - jnp.roll(y, 1)) / 2.0
+        mag = jnp.sqrt(x_s ** 2 + y_s ** 2 + _EPS_JAX)
+        return x_s / mag, y_s / mag
+
+    def _jax_richards_velocity(
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        c: jnp.ndarray,
+        theta: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Richards' elliptical spread velocity (JAX)."""
+        x_s, y_s = _jax_spatial_derivatives(x, y)
+
+        cos_th = jnp.cos(theta)
+        sin_th = jnp.sin(theta)
+
+        term1 = x_s * cos_th - y_s * sin_th
+        term2 = x_s * sin_th + y_s * cos_th
+
+        denom = jnp.sqrt(a ** 2 * term1 ** 2 + b ** 2 * term2 ** 2 + _EPS_JAX)
+
+        x_t = (b ** 2 * cos_th * term2 - a ** 2 * sin_th * term1) / denom + c * sin_th
+        y_t = (-b ** 2 * sin_th * term2 - a ** 2 * cos_th * term1) / denom + c * cos_th
+
+        return x_t, y_t
+
+    def _jax_marker_velocity(
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        ros_2d: jnp.ndarray,
+        bros_2d: jnp.ndarray,
+        fros_2d: jnp.ndarray,
+        raz_2d: jnp.ndarray,
+        x0: float,
+        y0: float,
+        dx: float,
+        dy: float,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Sample FBP grids at markers, return Richards velocity."""
+        ros = _jax_bilinear_sample(ros_2d, x, y, x0, y0, dx, dy)
+        bros = _jax_bilinear_sample(bros_2d, x, y, x0, y0, dx, dy)
+        fros = _jax_bilinear_sample(fros_2d, x, y, x0, y0, dx, dy)
+        raz = _jax_bilinear_sample(raz_2d, x, y, x0, y0, dx, dy)
+
+        a = 0.5 * (ros + bros)
+        b = fros
+        c_param = 0.5 * (ros - bros)
+
+        return _jax_richards_velocity(x, y, a, b, c_param, raz)
+
+    def _jax_packed_velocity(
+        z: jnp.ndarray,
+        ros_2d: jnp.ndarray,
+        bros_2d: jnp.ndarray,
+        fros_2d: jnp.ndarray,
+        raz_2d: jnp.ndarray,
+        x0: float,
+        y0: float,
+        dx: float,
+        dy: float,
+    ) -> jnp.ndarray:
+        """Velocity on packed state z = [x0,y0,x1,y1,...] → [vx0,vy0,...]."""
+        x = z[0::2]
+        y = z[1::2]
+        vx, vy = _jax_marker_velocity(
+            x, y, ros_2d, bros_2d, fros_2d, raz_2d, x0, y0, dx, dy,
+        )
+        v = jnp.zeros_like(z)
+        v = v.at[0::2].set(vx)
+        v = v.at[1::2].set(vy)
+        return v
+
+    # -----------------------------------------------------------------
+    # Differentiable Euler Extrapolation (Richardson)
+    # -----------------------------------------------------------------
+
+    def jax_euler_extrapolation_step(
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        dt: jnp.ndarray,
+        ros_2d: jnp.ndarray,
+        bros_2d: jnp.ndarray,
+        fros_2d: jnp.ndarray,
+        raz_2d: jnp.ndarray,
+        x0: float,
+        y0: float,
+        dx: float,
+        dy: float,
+        n_base: int = 1,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Differentiable Euler extrapolation (Richardson) step in JAX.
+
+        Runs forward Euler at two resolutions (``n_base`` and ``2·n_base``
+        sub-steps) and extrapolates to cancel the leading-order error,
+        yielding second-order temporal accuracy.
+
+        Fully differentiable via standard JAX autodiff — no custom VJP
+        required.  ``n_base`` must be a Python int (static for JIT).
+
+        Parameters
+        ----------
+        x, y : jnp.ndarray
+            Marker positions (N,).
+        dt : scalar
+            Time step (traced — gradients flow through it).
+        ros_2d, bros_2d, fros_2d, raz_2d : jnp.ndarray
+            FBP parameter grids for this timestep (ny, nx).
+        x0, y0, dx, dy : float
+            Grid origin and spacing (static).
+        n_base : int
+            Base sub-step count (static for JIT).
+
+        Returns
+        -------
+        x_new, y_new : jnp.ndarray
+            Extrapolated marker positions.
+        """
+        def _make_euler_body(dt_sub):
+            def body(carry, _):
+                x_, y_ = carry
+                vx, vy = _jax_marker_velocity(
+                    x_, y_, ros_2d, bros_2d, fros_2d, raz_2d,
+                    x0, y0, dx, dy,
+                )
+                return (x_ + dt_sub * vx, y_ + dt_sub * vy), None
+            return body
+
+        # Coarse: n_base steps
+        (x_c, y_c), _ = lax.scan(
+            _make_euler_body(dt / n_base), (x, y), None, length=n_base,
+        )
+
+        # Fine: 2·n_base steps
+        (x_f, y_f), _ = lax.scan(
+            _make_euler_body(dt / (2 * n_base)), (x, y), None, length=2 * n_base,
+        )
+
+        # Richardson extrapolation: 2·fine − coarse
+        return 2.0 * x_f - x_c, 2.0 * y_f - y_c
+
+    # -----------------------------------------------------------------
+    # Differentiable Implicit Euler with custom VJP
+    # (Implicit Function Theorem — avoids differentiating through Newton)
+    # -----------------------------------------------------------------
+
+    @_jax_partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12))
+    def jax_implicit_euler_step(
+        x: jnp.ndarray,
+        y: jnp.ndarray,
+        dt,
+        ros_2d: jnp.ndarray,
+        bros_2d: jnp.ndarray,
+        fros_2d: jnp.ndarray,
+        raz_2d: jnp.ndarray,
+        x0: float = 0.0,
+        y0: float = 0.0,
+        dx: float = 1.0,
+        dy: float = 1.0,
+        max_iters: int = 4,
+        tol: float = 1e-10,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Implicit Euler step with custom VJP via the implicit function theorem.
+
+        **Forward pass** — fixed-point iteration (no Jacobian needed):
+
+            z^{m+1} = z^n + dt · g(z^m)
+
+        **Backward pass** — one adjoint linear solve using the Jacobian at
+        the converged solution z*:
+
+            [I − dt · J_g]^T  μ = λ       (adjoint system)
+            ∂L/∂z₀ = μ                    (gradient w.r.t. initial markers)
+            ∂L/∂dt = μ^T g(z*)            (gradient w.r.t. time step)
+            ∂L/∂θ  = dt · (∂g/∂θ)^T μ    (gradient w.r.t. FBP grids)
+
+        Because the backward pass uses the implicit function theorem
+        rather than differentiating through the iterations, it is both
+        cheaper and more numerically stable than unrolled autodiff.
+
+        Parameters
+        ----------
+        x, y : jnp.ndarray
+            Marker positions (N,).
+        dt : scalar
+            Time step (traced).
+        ros_2d, bros_2d, fros_2d, raz_2d : jnp.ndarray
+            FBP parameter grids (ny, nx).
+        x0, y0, dx, dy : float
+            Grid metadata (static, non-differentiable).
+        max_iters : int
+            Fixed-point iterations (static).
+        tol : float
+            Unused (reserved for early stopping); iterations are fixed
+            for JIT compatibility.
+
+        Returns
+        -------
+        x_new, y_new : jnp.ndarray
+            Updated marker positions.
+        """
+        N2 = 2 * len(x)
+        z0 = jnp.zeros(N2)
+        z0 = z0.at[0::2].set(x)
+        z0 = z0.at[1::2].set(y)
+
+        g_args = (ros_2d, bros_2d, fros_2d, raz_2d)
+
+        # Forward Euler predictor
+        g0 = _jax_packed_velocity(z0, *g_args, x0, y0, dx, dy)
+        zm = z0 + dt * g0
+
+        # Fixed-point iterations: z^{m+1} = z^n + dt * g(z^m)
+        def _fp_body(_, zm_):
+            gm = _jax_packed_velocity(zm_, *g_args, x0, y0, dx, dy)
+            return z0 + dt * gm
+
+        zm = lax.fori_loop(0, max_iters, _fp_body, zm)
+
+        return zm[0::2], zm[1::2]
+
+    def _implicit_fwd(x, y, dt, ros_2d, bros_2d, fros_2d, raz_2d,
+                      x0, y0, dx, dy, max_iters, tol):
+        """Forward rule: run primal, stash residuals for backward."""
+        x_out, y_out = jax_implicit_euler_step(
+            x, y, dt, ros_2d, bros_2d, fros_2d, raz_2d,
+            x0, y0, dx, dy, max_iters, tol,
+        )
+        residuals = (x, y, dt, ros_2d, bros_2d, fros_2d, raz_2d, x_out, y_out)
+        return (x_out, y_out), residuals
+
+    def _implicit_bwd(x0, y0, dx, dy, max_iters, tol, residuals, cotangents):
+        """
+        Backward rule via the implicit function theorem.
+
+        Given the implicit equation F(z*, z₀, θ) = z* − z₀ − dt·g(z*, θ) = 0,
+        the adjoint μ satisfies [I − dt·J_g]^T μ = λ.  All parameter
+        gradients then follow from μ without differentiating through the
+        forward iterations.
+        """
+        x_in, y_in, dt, ros_2d, bros_2d, fros_2d, raz_2d, x_star, y_star = residuals
+        lam_x, lam_y = cotangents
+
+        N2 = 2 * len(x_star)
+
+        # Pack converged solution and cotangent
+        z_star = jnp.zeros(N2)
+        z_star = z_star.at[0::2].set(x_star)
+        z_star = z_star.at[1::2].set(y_star)
+
+        lam = jnp.zeros(N2)
+        lam = lam.at[0::2].set(lam_x)
+        lam = lam.at[1::2].set(lam_y)
+
+        g_args = (ros_2d, bros_2d, fros_2d, raz_2d)
+
+        # J_g = ∂g/∂z at z* (2N × 2N Jacobian)
+        J_g = jax.jacrev(_jax_packed_velocity)(
+            z_star, *g_args, x0, y0, dx, dy,
+        )
+
+        # Adjoint solve: [I − dt · J_g]^T μ = λ
+        A = jnp.eye(N2) - dt * J_g
+        mu = jnp.linalg.solve(A.T, lam)
+
+        # ∂L/∂z₀ = μ  (since ∂F/∂z₀ = −I)
+        grad_x_in = mu[0::2]
+        grad_y_in = mu[1::2]
+
+        # ∂L/∂dt = μ^T · g(z*)
+        g_star = _jax_packed_velocity(z_star, *g_args, x0, y0, dx, dy)
+        grad_dt = jnp.dot(mu, g_star)
+
+        # ∂L/∂θ = dt · (∂g/∂θ)^T · μ   via VJP of g w.r.t. parameter grids
+        _, vjp_params = jax.vjp(
+            lambda r, b, f, a: _jax_packed_velocity(
+                z_star, r, b, f, a, x0, y0, dx, dy,
+            ),
+            *g_args,
+        )
+        grad_ros, grad_bros, grad_fros, grad_raz = vjp_params(dt * mu)
+
+        return (grad_x_in, grad_y_in, grad_dt,
+                grad_ros, grad_bros, grad_fros, grad_raz)
+
+    jax_implicit_euler_step.defvjp(_implicit_fwd, _implicit_bwd)

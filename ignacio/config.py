@@ -150,6 +150,10 @@ class WeatherConfig(BaseModel):
     spread_event_lambda: float = Field(3.76, ge=0)
     calculate_fwi: bool = Field(True, description="Calculate FWI from hourly weather if not present")
     fwi_latitude: float | None = Field(None, description="Latitude for FWI calculation (uses DEM center if not set)")
+    additional_stations: list[dict] = Field(
+        default_factory=list,
+        description="Additional weather stations [{path, latitude, longitude}] for spatial interpolation"
+    )
 
 
 class FBPDefaultsConfig(BaseModel):
@@ -188,7 +192,12 @@ class FBPConfig(BaseModel):
     slope_factor: float = Field(0.5, ge=0, description="Slope effect strength")
     backing_fraction: float = Field(0.2, ge=0, le=1, description="BROS/ROS ratio")
     length_to_breadth: float = Field(2.0, gt=0, description="Fire shape L/B ratio")
+    ros_scale: float = Field(1.0, gt=0, description="Multiplier on all ROS components (ROS, BROS, FROS)")
     wind: WindConfig = Field(default_factory=WindConfig)
+    terrain_wind_deflection: float = Field(
+        0.0, ge=0, le=1,
+        description="Terrain wind deflection weight (0=none, 0.3=moderate valley channeling, 1=full)"
+    )
     elevation_adjustment: ElevationAdjustmentConfig = Field(
         default_factory=ElevationAdjustmentConfig
     )
@@ -309,15 +318,26 @@ class MarkerMethodConfig(BaseModel):
         return self
 
 
+class LevelSetConfig(BaseModel):
+    """Level set solver configuration (JAX-based)."""
+
+    cfl_factor: float = Field(0.5, gt=0, le=1.0, description="CFL safety factor for sub-stepping")
+    reinit_interval: int = Field(5, ge=1, description="Reinitialize φ every N outer steps")
+    reinit_iters: int = Field(10, ge=1, description="Pseudo-time iterations for reinitialization")
+    narrow_band_width: int | None = Field(None, ge=1, description="Optional narrow-band optimization (cells)")
+
+
 class SimulationConfig(BaseModel):
     """Simulation parameters configuration."""
-    
+
     dt: float = Field(1.0, gt=0, description="Time step in minutes")
     max_duration: float = Field(1440, gt=0, description="Max duration in minutes")
     n_vertices: int = Field(300, ge=10, description="Fire perimeter vertices")
     initial_radius: float = Field(0.5, gt=0, description="Initial fire radius (m)")
     store_every: int = Field(10, ge=1, description="Storage frequency")
+    spread_method: Literal["marker", "levelset"] = Field("marker", description="Spread method: 'marker' or 'levelset'")
     marker_method: MarkerMethodConfig = Field(default_factory=MarkerMethodConfig)
+    level_set: LevelSetConfig = Field(default_factory=LevelSetConfig)
     min_ros: float = Field(0.01, ge=0, description="Minimum ROS threshold")
     interpolation_resolution: float = Field(30.0, gt=0)
     
@@ -325,6 +345,7 @@ class SimulationConfig(BaseModel):
     time_varying_weather: bool = Field(True, description="Enable time-varying weather")
     start_datetime: str | None = Field(None, description="Simulation start datetime (ISO format)")
     default_start_hour: int = Field(12, ge=0, le=23, description="Default start hour if not specified")
+    wind_direction_noise_std: float = Field(0.0, ge=0, description="Gaussian noise std (degrees) added to WD each timestep")
 
 
 class OutputConfig(BaseModel):
@@ -386,9 +407,32 @@ class FuelBreakConfig(BaseModel):
         return self
 
 
+class CalibrationConfig(BaseModel):
+    """Calibration settings for parameter optimization."""
+
+    enabled: bool = Field(False, description="Run calibration instead of simulation")
+    observed_perimeter_path: str | None = Field(None, description="Path to observed fire perimeter (shapefile/GeoJSON)")
+    method: Literal["adam", "nelder-mead", "two-stage"] = Field("adam", description="Optimization method")
+    params: list[str] = Field(
+        default_factory=lambda: ["ros_scale"],
+        description="Parameters to calibrate: ros_scale, wind_direction_offset, backing_scale, flanking_scale",
+    )
+    n_iters: int = Field(30, ge=1, description="Maximum optimization iterations")
+    learning_rate: float = Field(0.01, gt=0, description="Adam learning rate")
+    max_steps: int | None = Field(None, ge=1, description="Max simulation steps (overrides max_duration/dt)")
+    resolution: float = Field(0.001, gt=0, description="Rasterization resolution for metrics (CRS units)")
+    w_jaccard: float = Field(1.0, ge=0, description="Weight for (1-Jaccard) loss")
+    w_size: float = Field(0.5, ge=0, description="Weight for centroid size ratio loss")
+    w_shape: float = Field(0.3, ge=0, description="Weight for Procrustes RMSE loss")
+    w_area: float = Field(0.5, ge=0, description="Weight for area mismatch loss (Adam only)")
+    w_perimeter: float = Field(1.0, ge=0, description="Weight for phi-perimeter loss (Adam only)")
+    filter_main_complex: bool = Field(False, description="Filter observed perimeter to main fire complex, dropping tiny fragments")
+    min_area_fraction: float = Field(0.01, ge=0, le=1, description="Min polygon area as fraction of largest (for filter_main_complex)")
+
+
 class IgnacioConfig(BaseModel):
     """Root configuration model for Ignacio."""
-    
+
     project: ProjectConfig
     crs: CRSConfig = Field(default_factory=CRSConfig)
     terrain: TerrainConfig
@@ -398,6 +442,7 @@ class IgnacioConfig(BaseModel):
     fbp: FBPConfig = Field(default_factory=FBPConfig)
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     # Backward-compatible single fuel break (deprecated; prefer `fuel_breaks`)
     fuel_break: FuelBreakConfig | None = Field(
         default=None,

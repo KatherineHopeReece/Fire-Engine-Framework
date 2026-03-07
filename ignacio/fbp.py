@@ -645,6 +645,162 @@ def compute_ros(
 
 
 # =============================================================================
+# Length-to-Breadth Ratio and Backing ROS (wind-dependent)
+# =============================================================================
+#
+# Canadian FBP System (Forestry Canada, 1992; ST-X-3, Eq. 79-81):
+#
+#   For non-grass fuels:
+#       LB = 1.0 + 8.729 * (1 - exp(-0.030 * WS))^2.155
+#
+#   For O-1a/O-1b grass fuels:
+#       LB = 1.1 * (1 - exp(-0.023 * WS))^0.5 + 1.0   (Eq. 80, simplified)
+#
+# Backing ROS (ST-X-3, Eq. 76):
+#       BROS = ROS_head * (1 - c_b) / (1 + c_b)
+#   where c_b = (LB^2 - 1) / (LB^2 + 1)^0.5 ... but the standard simplified
+#   approach is:
+#       a = (ROS_head + BROS) / 2       (semi-major axis of ellipse)
+#       c = (ROS_head - BROS) / 2       (offset from center)
+#       b = FROS                        (semi-minor axis)
+#
+# The standard FBP relationships (Alexander 1985, Eq. 1-3):
+#       BROS = ROS_head * ((LB - (LB^2 - 1)^0.5) / (LB + (LB^2 - 1)^0.5))
+#   Which simplifies from the ellipse geometry:
+#       BROS = ROS_head * (LB - sqrt(LB^2 - 1))^2
+#            ≈ ROS_head / (2 * LB - 1)   for LB >> 1
+#
+# And flanking ROS:
+#       FROS = (ROS_head + BROS) / (2 * LB)
+# =============================================================================
+
+
+def compute_length_to_breadth(wind_speed: float, fuel_type: str = "") -> float:
+    """
+    Compute fire ellipse length-to-breadth ratio from wind speed.
+
+    Parameters
+    ----------
+    wind_speed : float
+        Wind speed in km/h.
+    fuel_type : str
+        FBP fuel type code (e.g. "C-2", "O-1a").  Grass fuels use a
+        different equation.
+
+    Returns
+    -------
+    float
+        Length-to-breadth ratio (>= 1.0).
+
+    References
+    ----------
+    Forestry Canada (1992), ST-X-3, Equations 79-80.
+    """
+    ws = max(0.0, float(wind_speed))
+    ft = fuel_type.upper().strip()
+
+    if ft.startswith("O-1") or ft.startswith("O1"):
+        # Grass fuels (Eq. 80)
+        lb = 1.1 * (1.0 - np.exp(-0.023 * ws)) ** 0.5 + 1.0
+    else:
+        # All other fuels (Eq. 79)
+        lb = 1.0 + 8.729 * (1.0 - np.exp(-0.030 * ws)) ** 2.155
+
+    return max(1.0, float(lb))
+
+
+def compute_length_to_breadth_grid(
+    wind_speed: float | np.ndarray,
+    fuel_grid: np.ndarray | None = None,
+    fuel_lookup: dict[int, str] | None = None,
+) -> float | np.ndarray:
+    """
+    Vectorised L/B computation.  If *fuel_grid* is given, grass cells get the
+    grass equation; everything else gets the standard equation.  Otherwise a
+    single scalar L/B is returned.
+    """
+    ws = np.maximum(np.asarray(wind_speed, dtype=np.float64), 0.0)
+
+    lb_std = 1.0 + 8.729 * (1.0 - np.exp(-0.030 * ws)) ** 2.155
+
+    if fuel_grid is None or fuel_lookup is None:
+        return np.maximum(lb_std, 1.0)
+
+    # Identify grass cells
+    grass_mask = np.zeros(fuel_grid.shape, dtype=bool)
+    for fid, fname in fuel_lookup.items():
+        if fname.upper().startswith("O-1") or fname.upper().startswith("O1"):
+            grass_mask |= (fuel_grid == fid)
+
+    if not np.any(grass_mask):
+        return np.maximum(lb_std, 1.0)
+
+    lb_grass = 1.1 * (1.0 - np.exp(-0.023 * ws)) ** 0.5 + 1.0
+    lb = np.where(grass_mask, lb_grass, lb_std)
+    return np.maximum(lb, 1.0).astype(np.float32)
+
+
+def compute_backing_ros(ros_head: float | np.ndarray, lb: float | np.ndarray) -> float | np.ndarray:
+    """
+    Compute backing rate of spread from head ROS and L/B ratio.
+
+    Uses the FBP ellipse relationship (Alexander 1985):
+
+        BROS = ROS_head * ( LB - sqrt(LB^2 - 1) )^2
+
+    This is equivalent to the standard formula and gives BROS/ROS ~ 0.04
+    at LB = 2.5 (typical wind), approaching 1.0 as LB → 1.0 (calm).
+
+    Parameters
+    ----------
+    ros_head : float or ndarray
+        Head fire rate of spread (m/min).
+    lb : float or ndarray
+        Length-to-breadth ratio (>= 1.0).
+
+    Returns
+    -------
+    float or ndarray
+        Backing rate of spread (m/min).
+    """
+    lb = np.maximum(np.asarray(lb, dtype=np.float64), 1.0)
+    ros_head = np.asarray(ros_head, dtype=np.float64)
+
+    # FBP ellipse: BROS = ROS * (LB - sqrt(LB^2 - 1))^2
+    discriminant = np.sqrt(np.maximum(lb ** 2 - 1.0, 0.0))
+    ratio = (lb - discriminant) / (lb + discriminant + 1e-12)
+    bros = ros_head * ratio
+
+    return np.maximum(bros, 0.0)
+
+
+def compute_flanking_ros(
+    ros_head: float | np.ndarray,
+    bros: float | np.ndarray,
+    lb: float | np.ndarray,
+) -> float | np.ndarray:
+    """
+    Compute flanking rate of spread.
+
+        FROS = (ROS_head + BROS) / (2 * LB)
+
+    Parameters
+    ----------
+    ros_head, bros : float or ndarray
+        Head and backing ROS (m/min).
+    lb : float or ndarray
+        Length-to-breadth ratio.
+
+    Returns
+    -------
+    float or ndarray
+        Flanking rate of spread (m/min).
+    """
+    lb = np.maximum(np.asarray(lb, dtype=np.float64), 1.0)
+    return np.maximum((np.asarray(ros_head) + np.asarray(bros)) / (2.0 * lb), 0.0)
+
+
+# =============================================================================
 # Rate of Spread Grid Computation
 # =============================================================================
 
@@ -663,50 +819,60 @@ class ROSComponents:
 def compute_ros_components(
     ros_head: float,
     wind_direction: float,
-    backing_fraction: float = 0.2,
-    lb_ratio: float = 2.0,
+    wind_speed: float = 0.0,
+    fuel_type: str = "",
+    backing_fraction: float | None = None,
+    lb_ratio: float | None = None,
 ) -> ROSComponents:
     """
     Compute all rate of spread components from head fire ROS.
-    
+
     Parameters
     ----------
     ros_head : float
         Head fire rate of spread (m/min).
     wind_direction : float
         Wind direction in degrees (direction wind comes FROM).
-    backing_fraction : float
-        Back fire ROS as fraction of head fire ROS.
-    lb_ratio : float
-        Length-to-breadth ratio of fire ellipse.
-        
+    wind_speed : float
+        Wind speed in km/h.  Used to compute L/B and BROS from FBP
+        equations when *lb_ratio* / *backing_fraction* are not given.
+    fuel_type : str
+        FBP fuel type code (grass fuels use a different L/B curve).
+    backing_fraction : float, optional
+        **Deprecated** — fixed BROS/ROS ratio.  If given, overrides the
+        wind-dependent calculation.
+    lb_ratio : float, optional
+        **Deprecated** — fixed L/B ratio.  If given, overrides the
+        wind-dependent calculation.
+
     Returns
     -------
     ROSComponents
         All ROS components.
-        
-    Notes
-    -----
-    The fire ellipse relationships are:
-    
-        ROS_back = backing_fraction * ROS_head
-        ROS_flank = (ROS_head + ROS_back) / (2 * LB)
-        
-    The spread azimuth (RAZ) is the direction of maximum spread,
-    which is the direction the wind is blowing TO (opposite of FROM).
     """
-    ros_back = backing_fraction * ros_head
-    ros_flank = (ros_head + ros_back) / (2.0 * lb_ratio)
-    
+    # Wind-dependent L/B (default)
+    if lb_ratio is None:
+        lb = compute_length_to_breadth(wind_speed, fuel_type=fuel_type)
+    else:
+        lb = max(1.0, float(lb_ratio))
+
+    # Wind-dependent BROS (default)
+    if backing_fraction is not None:
+        ros_back = float(backing_fraction) * ros_head
+    else:
+        ros_back = float(compute_backing_ros(ros_head, lb))
+
+    ros_flank = float(compute_flanking_ros(ros_head, ros_back, lb))
+
     # RAZ is direction fire spreads TO (wind blows fire forward)
     raz = (wind_direction + 180.0) % 360.0
-    
+
     return ROSComponents(
         ros_head=ros_head,
         ros_flank=ros_flank,
         ros_back=ros_back,
         raz=raz,
-        lb_ratio=lb_ratio,
+        lb_ratio=lb,
     )
 
 

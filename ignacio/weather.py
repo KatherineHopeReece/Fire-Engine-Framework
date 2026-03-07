@@ -264,10 +264,19 @@ def load_weather_data(config: IgnacioConfig) -> pd.DataFrame:
     
     # Parse datetime - try configured column first, then common alternatives
     datetime_col = None
-    for col in ["DATETIME", "HOURLY", "DATE", "DATE_TIME", "TIMESTAMP"]:
-        if col in df.columns:
-            datetime_col = col
-            break
+    # Check the user-configured datetime column name (original and uppercased)
+    if col_config and col_config.datetime:
+        cfg_dt = col_config.datetime
+        if cfg_dt in df.columns:
+            datetime_col = cfg_dt
+        elif cfg_dt.upper() in df.columns:
+            datetime_col = cfg_dt.upper()
+    # Fall back to common column names
+    if datetime_col is None:
+        for col in ["DATETIME", "HOURLY", "DATE", "DATE_TIME", "TIMESTAMP"]:
+            if col in df.columns:
+                datetime_col = col
+                break
     
     if datetime_col:
         try:
@@ -718,7 +727,13 @@ def get_representative_weather(
             if col in high_danger_df.columns:
                 values = pd.to_numeric(high_danger_df[col], errors="coerce").dropna()
                 if len(values) > 0:
-                    if use_percentile and key in ["isi", "bui", "fwi", "wind_speed"]:
+                    if key == "wind_direction":
+                        # Circular mean for wind direction (scalar median is wrong for angles)
+                        rads = np.radians(values.values)
+                        mean_sin = np.mean(np.sin(rads))
+                        mean_cos = np.mean(np.cos(rads))
+                        weather[key] = float(np.degrees(np.arctan2(mean_sin, mean_cos)) % 360.0)
+                    elif use_percentile and key in ["isi", "bui", "fwi", "wind_speed"]:
                         # Use upper percentile for fire-critical variables
                         weather[key] = float(np.percentile(values, percentile))
                     else:
@@ -928,6 +943,110 @@ class HourlyWeatherInterpolator:
             weather_seq.append(self.interpolate_at(sim_dt))
         
         return weather_seq
+
+
+class MultiStationInterpolator:
+    """
+    Spatial interpolation of weather from multiple stations using IDW.
+
+    Inverse Distance Weighting (IDW) combines observations from multiple
+    weather stations, giving more weight to nearer stations.
+    """
+
+    def __init__(
+        self,
+        interpolators: list[HourlyWeatherInterpolator],
+        station_coords: list[tuple[float, float]],
+        power: float = 2.0,
+    ):
+        """
+        Parameters
+        ----------
+        interpolators : list of HourlyWeatherInterpolator
+            One per station.
+        station_coords : list of (longitude, latitude)
+            Station coordinates in the same CRS as the fire grid.
+        power : float
+            IDW power parameter (2.0 = inverse square distance).
+        """
+        self.interpolators = interpolators
+        self.station_coords = np.array(station_coords, dtype=np.float64)
+        self.power = power
+
+    def interpolate_at(
+        self,
+        dt: pd.Timestamp,
+        target_x: float | None = None,
+        target_y: float | None = None,
+    ) -> dict[str, float]:
+        """
+        Interpolate weather at a target point and time using IDW.
+
+        If target coordinates are not given, returns simple average
+        (equal-weight blend).
+        """
+        station_values = [interp.interpolate_at(dt) for interp in self.interpolators]
+
+        if target_x is None or target_y is None or len(self.interpolators) == 1:
+            # Simple average fallback
+            return self._average_values(station_values)
+
+        target = np.array([target_x, target_y])
+        distances = np.sqrt(np.sum((self.station_coords - target) ** 2, axis=1))
+        distances = np.maximum(distances, 1e-10)  # avoid division by zero
+
+        weights = 1.0 / (distances ** self.power)
+        weights /= weights.sum()
+
+        result = {}
+        # Get all keys from the first station
+        all_keys = set()
+        for sv in station_values:
+            all_keys.update(sv.keys())
+
+        for key in all_keys:
+            vals = []
+            ws = []
+            for i, sv in enumerate(station_values):
+                if key in sv and np.isfinite(sv[key]):
+                    vals.append(sv[key])
+                    ws.append(weights[i])
+
+            if not vals:
+                continue
+
+            ws_arr = np.array(ws)
+            ws_arr /= ws_arr.sum()
+
+            if key in ("WD", "WIND_DIRECTION"):
+                # Circular IDW for wind direction
+                rads = np.radians(vals)
+                sin_avg = np.sum(ws_arr * np.sin(rads))
+                cos_avg = np.sum(ws_arr * np.cos(rads))
+                result[key] = float(np.degrees(np.arctan2(sin_avg, cos_avg)) % 360.0)
+            else:
+                result[key] = float(np.sum(ws_arr * np.array(vals)))
+
+        return result
+
+    def _average_values(self, station_values: list[dict]) -> dict[str, float]:
+        """Simple average across stations."""
+        all_keys = set()
+        for sv in station_values:
+            all_keys.update(sv.keys())
+
+        result = {}
+        for key in all_keys:
+            vals = [sv[key] for sv in station_values if key in sv and np.isfinite(sv[key])]
+            if not vals:
+                continue
+            if key in ("WD", "WIND_DIRECTION"):
+                rads = np.radians(vals)
+                result[key] = float(np.degrees(np.arctan2(
+                    np.mean(np.sin(rads)), np.mean(np.cos(rads)))) % 360.0)
+            else:
+                result[key] = float(np.mean(vals))
+        return result
 
 
 def create_weather_interpolator(
