@@ -477,5 +477,80 @@ def compute_elevation_adjustment(
     
     # Clamp to reasonable range
     factor = np.clip(factor, 0.7, 1.3)
-    
+
     return factor
+
+
+# =============================================================================
+# Terrain-Aware Wind Deflection
+# =============================================================================
+
+
+def compute_terrain_wind_direction(
+    wind_direction: float,
+    aspect_deg: np.ndarray,
+    slope_deg: np.ndarray,
+    deflection_weight: float = 0.0,
+) -> np.ndarray:
+    """
+    Deflect wind direction based on local terrain (valley channeling).
+
+    In mountain terrain, winds are channeled along valleys. This function
+    blends the synoptic wind direction with the local upslope direction,
+    weighted by slope steepness. Steeper slopes cause more deflection
+    toward the valley axis.
+
+    Parameters
+    ----------
+    wind_direction : float
+        Synoptic wind direction in degrees (FROM direction, meteorological).
+    aspect_deg : np.ndarray
+        Aspect in degrees clockwise from north (ny, nx).
+    slope_deg : np.ndarray
+        Slope in degrees (ny, nx).
+    deflection_weight : float
+        Strength of terrain deflection (0 = no deflection, 1 = full deflection
+        toward valley axis). Recommended range: 0.1-0.5.
+
+    Returns
+    -------
+    np.ndarray
+        Deflected wind direction grid (ny, nx), in degrees (FROM direction).
+    """
+    if deflection_weight <= 0:
+        return np.full_like(aspect_deg, wind_direction)
+
+    # Valley axis is perpendicular to aspect (contour direction).
+    # Upslope = aspect + 180; valley axis = aspect ± 90.
+    # Wind gets deflected toward whichever valley axis direction is closer
+    # to the synoptic wind.
+    wd_rad = np.radians(wind_direction)
+    aspect_rad = np.radians(aspect_deg)
+
+    # Two candidate valley directions (perpendicular to slope)
+    valley1_rad = aspect_rad + np.pi / 2
+    valley2_rad = aspect_rad - np.pi / 2
+
+    # Pick the valley direction closer to the synoptic wind
+    diff1 = np.arctan2(np.sin(wd_rad - valley1_rad), np.cos(wd_rad - valley1_rad))
+    diff2 = np.arctan2(np.sin(wd_rad - valley2_rad), np.cos(wd_rad - valley2_rad))
+    valley_rad = np.where(np.abs(diff1) < np.abs(diff2), valley1_rad, valley2_rad)
+
+    # Weight deflection by normalized slope (steeper = more channeling)
+    # Use sigmoid-like ramp: minimal effect below 5°, full effect above 30°
+    slope_factor = np.clip((slope_deg - 5.0) / 25.0, 0.0, 1.0)
+    effective_weight = deflection_weight * slope_factor
+
+    # Handle NaN aspect (flat terrain → no deflection)
+    effective_weight = np.where(np.isfinite(aspect_deg), effective_weight, 0.0)
+
+    # Replace NaN valley directions with synoptic wind (no contribution when weight=0)
+    valley_rad_safe = np.where(np.isfinite(valley_rad), valley_rad, wd_rad)
+
+    # Circular blend between synoptic and valley direction
+    cos_blend = (1 - effective_weight) * np.cos(wd_rad) + effective_weight * np.cos(valley_rad_safe)
+    sin_blend = (1 - effective_weight) * np.sin(wd_rad) + effective_weight * np.sin(valley_rad_safe)
+    deflected_rad = np.arctan2(sin_blend, cos_blend)
+
+    deflected_deg = np.degrees(deflected_rad) % 360.0
+    return deflected_deg.astype(np.float32)
