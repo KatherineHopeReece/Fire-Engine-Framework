@@ -1227,7 +1227,7 @@ def simulate_single_fire(
             history=FirePerimeterHistory(perimeters=[], times=[]),
         )
     
-    # Markersmethodchange: log chosen advection integrator from YAML ("rk4" or "euler")
+    # Markersmethodchange: log chosen advection integrator from YAML.
     try:
         logger.info(
             f"Requested advection integrator: {getattr(sim_config.marker_method, 'advection_integrator', None)}"

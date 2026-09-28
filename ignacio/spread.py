@@ -25,7 +25,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Marker maintenance + higher-order advection helpers (RK4)
+# Marker maintenance + higher-order advection helpers (Heun/RK4)
 # =============================================================================
 
 def _closed_diffs_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -172,6 +172,23 @@ def _rk4_step_xy(
     x_new = x + (dt / 6.0) * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
     y_new = y + (dt / 6.0) * (k1y + 2.0 * k2y + 2.0 * k3y + k4y)
 
+    return x_new, y_new
+
+
+def _heun_step_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    dt: float,
+    vel_fn,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Take one second-order Heun step for marker advection."""
+    vx_start, vy_start = vel_fn(x, y)
+    x_predict = x + dt * vx_start
+    y_predict = y + dt * vy_start
+    vx_predict, vy_predict = vel_fn(x_predict, y_predict)
+
+    x_new = x + 0.5 * dt * (vx_start + vx_predict)
+    y_new = y + 0.5 * dt * (vy_start + vy_predict)
     return x_new, y_new
 
 
@@ -977,7 +994,7 @@ def simulate_fire_spread(
     is_geographic: bool = False,
     center_latitude: float | None = None,
     # --- New (optional) controls for higher-order advection ---
-    advection_integrator: str = "euler",  # "euler" | "rk4" | "euler_extrap" | "implicit"
+    advection_integrator: str = "euler",  # "euler" | "heun" | "rk4" | "euler_extrap" | "implicit"
     resample_spacing: float | None = None,  # marker redistribution target spacing (coordinate units)
     insert_factor: float = 1.5,
     delete_factor: float = 0.5,
@@ -1028,6 +1045,7 @@ def simulate_fire_spread(
         Time integration scheme for marker advection.  Options:
 
         - ``"euler"`` — forward Euler (first-order, legacy default).
+        - ``"heun"`` — second-order Heun (explicit trapezoidal) method.
         - ``"rk4"`` — classical fourth-order Runge–Kutta.
         - ``"euler_extrap"`` — Euler extrapolation (Richardson): runs
           coarse and fine Euler solutions and extrapolates for
@@ -1121,7 +1139,7 @@ def simulate_fire_spread(
     for step in range(n_steps):
         # ------------------------------------------------------------------
         # Legacy Euler path (unchanged) samples only at the current vertices.
-        # RK4 path must sample the grid at intermediate stages to be correct.
+        # Higher-order paths must sample the grid at intermediate stages.
         # ------------------------------------------------------------------
 
         # Always sample current ROS in m/min for extinguishment logic
@@ -1133,7 +1151,7 @@ def simulate_fire_spread(
         integrator = (advection_integrator or "euler").strip().lower()
 
         # Shared velocity closure: resample the grid at arbitrary (x,y) positions.
-        # Used by both Euler and RK4 so that adaptive sub-stepping is consistent.
+        # Used by all integrators so that adaptive sub-stepping is consistent.
         def _vel_from_grid(xq: np.ndarray, yq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             """Compute velocity at query points by sampling parameter grid (step-local)."""
             # Sample ROS values at query positions (in m/min from FBP)
@@ -1174,7 +1192,31 @@ def simulate_fire_spread(
         # Save last known good coordinates for NaN recovery
         x_prev, y_prev = x.copy(), y.copy()
 
-        if integrator == "rk4":
+        if integrator == "heun":
+            # Adaptive sub-stepping to limit movement per substep (Heun)
+            x_t0, y_t0 = _vel_from_grid(x, y)
+            speed0 = np.hypot(x_t0, y_t0)
+            vmax = float(np.max(speed0)) if speed0.size > 0 else 0.0
+
+            if target_spacing > 0 and vmax > 0:
+                max_move = max_move_fraction * target_spacing
+                nsub = int(np.ceil((vmax * dt) / max_move))
+                nsub = int(np.clip(nsub, 1, max_substeps))
+            else:
+                nsub = 1
+
+            subdt = dt / nsub
+            for isub in range(nsub):
+                x, y = _heun_step_xy(x, y, subdt, _vel_from_grid)
+                if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+                    logger.warning(
+                        f"Non-finite coordinates at step {step}, substep {isub}, "
+                        "reverting to previous"
+                    )
+                    x, y = x_prev.copy(), y_prev.copy()
+                    break
+
+        elif integrator == "rk4":
             # Adaptive sub-stepping to limit movement per substep (RK4)
             x_t0, y_t0 = _vel_from_grid(x, y)
             speed0 = np.hypot(x_t0, y_t0)
