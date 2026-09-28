@@ -229,7 +229,7 @@ class MarkerMethodConfig(BaseModel):
     # --- In-solver marker advection + redistribution knobs ---
     # These map to the Markersmethodchange block in spread.py. They are optional so existing configs work.
     # Markersmethodchange: integrator selection (preferred over the legacy boolean)
-    advection_integrator: Literal["euler", "rk4"] = Field(
+    advection_integrator: Literal["euler", "heun", "rk4"] = Field(
         "rk4",
         description="Marker advection integrator to use during spread simulation.",
     )
