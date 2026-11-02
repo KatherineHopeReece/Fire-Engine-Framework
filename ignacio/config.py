@@ -322,7 +322,7 @@ class LevelSetConfig(BaseModel):
     """Level set solver configuration (JAX-based)."""
 
     cfl_factor: float = Field(0.5, gt=0, le=1.0, description="CFL safety factor for sub-stepping")
-    reinit_interval: int = Field(5, ge=1, description="Reinitialize φ every N outer steps")
+    reinit_interval: int = Field(5, ge=0, description="Reinitialize φ every N outer steps")
     reinit_iters: int = Field(10, ge=1, description="Pseudo-time iterations for reinitialization")
     narrow_band_width: int | None = Field(None, ge=1, description="Optional narrow-band optimization (cells)")
 

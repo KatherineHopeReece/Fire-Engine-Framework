@@ -19,6 +19,8 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.features import rasterize
 from rasterio.transform import Affine, rowcol, xy
+from rasterio.enums import Resampling
+from rasterio.warp import calculate_default_transform, reproject
 from shapely.geometry import Point, Polygon, MultiPolygon
 
 logger = logging.getLogger(__name__)
@@ -530,3 +532,86 @@ def load_npz(path: str | Path) -> dict[str, np.ndarray]:
 
 # Alias expected by simulation.py (backward compatibility)
 rasterize_geometries = rasterize_polygons
+
+def reproject_raster(
+    source: RasterData,
+    target_crs=None,
+    *,
+    reference: RasterData | None = None,
+    resampling=Resampling.bilinear,
+    nodata: float = np.nan,
+) -> RasterData:
+    """Project a raster, optionally matching another raster's grid exactly.
+
+    Use bilinear interpolation for elevation.
+    Use nearest-neighbour interpolation for categorical data such as fuel.
+    """
+    if source.crs is None:
+        raise ValueError(
+            "Source raster has no CRS; cannot reproject safely."
+        )
+
+    destination_crs = (
+        reference.crs if reference is not None else target_crs
+    )
+    if destination_crs is None:
+        raise ValueError("Destination raster CRS is required.")
+
+    destination_crs = CRS.from_user_input(destination_crs)
+
+    if reference is not None:
+        transform = reference.transform
+        height, width = reference.shape
+    elif (
+        source.crs == destination_crs
+        and source.transform.b == 0
+        and source.transform.d == 0
+    ):
+        transform = source.transform
+        height, width = source.shape
+    else:
+        bounds = rasterio.transform.array_bounds(
+            source.height,
+            source.width,
+            source.transform,
+        )
+        transform, width, height = calculate_default_transform(
+            source.crs,
+            destination_crs,
+            source.width,
+            source.height,
+            *bounds,
+        )
+
+    values = np.asarray(source.data, dtype=np.float64).copy()
+
+    invalid = ~np.isfinite(values)
+    if source.nodata is not None:
+        invalid |= values == source.nodata
+
+    values[invalid] = nodata
+
+    destination = np.full(
+        (height, width),
+        nodata,
+        dtype=np.float64,
+    )
+
+    reproject(
+        source=values,
+        destination=destination,
+        src_transform=source.transform,
+        src_crs=source.crs,
+        src_nodata=nodata,
+        dst_transform=transform,
+        dst_crs=destination_crs,
+        dst_nodata=nodata,
+        resampling=resampling,
+    )
+
+    return RasterData(
+        data=destination,
+        transform=transform,
+        crs=destination_crs,
+        nodata=nodata,
+    )

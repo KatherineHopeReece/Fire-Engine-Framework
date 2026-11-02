@@ -3,7 +3,9 @@ Fire spread equations for Ignacio.
 
 This module implements Richards' differential equations for elliptical fire
 spread using Huygens' wave propagation principle, along with the marker
-method for handling perimeter topology.
+method for handling perimeter topology. Multi-ignition front intersection is
+resolved by Shapely polygon union, preserving all separate front rings until
+first contact; legacy single-ignition numerical routines remain available.
 
 References
 ----------
@@ -17,7 +19,8 @@ References
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 
@@ -87,6 +90,177 @@ def _insert_delete_markers_by_spacing(
         y = y[keep]
 
     return x, y
+
+
+# =============================================================================
+# Categorical barrier geometry and fail-fast diagnostic checks
+# =============================================================================
+
+class MarkerBarrierError(ValueError):
+    """A proposed marker trajectory or perimeter entered non-burnable fuel."""
+
+
+def _barrier_geometry_from_grid(param_grid: "FireParameterGrid"):
+    """Polygonize categorical non-fuel cells using grid-centre affine geometry.
+
+    This is intentionally a CPU/Shapely diagnostic and is not used by the
+    differentiable JAX functions below. The fuel mask MUST align with ROS.
+    """
+    if param_grid.nonfuel_mask is None:
+        raise ValueError("Barrier checks require FireParameterGrid.nonfuel_mask")
+    try:
+        from affine import Affine
+        from rasterio.features import shapes
+        from shapely.geometry import shape
+        from shapely.ops import unary_union
+    except ImportError as exc:
+        raise ImportError("Barrier diagnostics require rasterio and shapely") from exc
+
+    mask = np.asarray(param_grid.nonfuel_mask, dtype=np.uint8)
+    dx = float(param_grid.x_coords[1] - param_grid.x_coords[0])
+    dy = float(param_grid.y_coords[1] - param_grid.y_coords[0])
+    transform = Affine.translation(
+        float(param_grid.x_coords[0]) - 0.5 * dx,
+        float(param_grid.y_coords[0]) - 0.5 * dy,
+    ) * Affine.scale(dx, dy)
+    parts = [
+        shape(geom) for geom, value in shapes(
+            mask, mask=mask.astype(bool), transform=transform
+        ) if int(value) == 1
+    ]
+    return unary_union(parts) if parts else None
+
+
+def _save_barrier_diagnostic(
+    old_ring, new_ring, violation_geometry, *,
+    reason: str, phase: str, time_min: float | None = None,
+    diagnostic_dir: str = "marker_barrier_debug",
+):
+    """Persist first failure geometries without altering the solver state."""
+    from pathlib import Path
+    from uuid import uuid4
+    import json
+    from shapely.geometry import LineString
+
+    folder = Path(diagnostic_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"barrier_{uuid4().hex[:10]}"
+    xy_new = np.column_stack(new_ring)
+    (folder / f"{name}_candidate_ring.wkt").write_text(
+        LineString(np.vstack([xy_new, xy_new[0]])).wkt, encoding="utf-8"
+    )
+    if old_ring is not None:
+        xy_old = np.column_stack(old_ring)
+        (folder / f"{name}_previous_ring.wkt").write_text(
+            LineString(np.vstack([xy_old, xy_old[0]])).wkt, encoding="utf-8"
+        )
+    if violation_geometry is not None:
+        (folder / f"{name}_intersection.wkt").write_text(
+            violation_geometry.wkt, encoding="utf-8"
+        )
+    (folder / f"{name}_metadata.json").write_text(
+        json.dumps({"time_min": time_min, "phase": phase, "reason": reason},
+                   indent=2), encoding="utf-8"
+    )
+    logger.error("Marker barrier violation diagnostics: %s", folder.resolve())
+
+
+def validate_marker_boundary(
+    x: np.ndarray, y: np.ndarray, barrier_geometry,
+    *, time_min: float | None = None, phase: str = "perimeter",
+    tolerance_m: float = 1e-6,
+    diagnostic_dir: str = "marker_barrier_debug",
+) -> None:
+    """Reject a ring segment crossing an obstacle INTERIOR.
+
+    Boundary contact is permitted. This does not test whether a ring encloses
+    an unburned island; full geometry export can represent such holes, but
+    interior-boundary evolution remains a separate unsolved capability.
+    """
+    from shapely.geometry import LineString, Point
+    if barrier_geometry is None or barrier_geometry.is_empty:
+        return
+    pts = np.column_stack((np.asarray(x, dtype=float),
+                           np.asarray(y, dtype=float)))
+    if len(pts) < 3 or not np.isfinite(pts).all():
+        raise MarkerBarrierError("Invalid marker coordinates during barrier check")
+    ring = LineString(np.vstack([pts, pts[0]]))
+    intersection = ring.intersection(barrier_geometry)
+    if intersection.length > tolerance_m:
+        reason = (f"{phase}: perimeter lies {intersection.length:.6f} m "
+                  "inside non-burnable fuel")
+        _save_barrier_diagnostic(None, (x, y), intersection,
+                                 reason=reason, phase=phase,
+                                 time_min=time_min,
+                                 diagnostic_dir=diagnostic_dir)
+        raise MarkerBarrierError(reason)
+    # Tangential intersections have zero length; points strictly inside are
+    # still prohibited. Covers rare zero-length malformed segments.
+    for xy in pts:
+        if barrier_geometry.contains(Point(*xy)):
+            reason = f"{phase}: marker lies inside non-burnable fuel at {tuple(xy)}"
+            _save_barrier_diagnostic(None, (x, y), Point(*xy),
+                                     reason=reason, phase=phase,
+                                     time_min=time_min,
+                                     diagnostic_dir=diagnostic_dir)
+            raise MarkerBarrierError(reason)
+
+
+def validate_marker_barrier_crossings(
+    x_old: np.ndarray, y_old: np.ndarray,
+    x_new: np.ndarray, y_new: np.ndarray,
+    barrier_geometry,
+    *, time_min: float | None = None, phase: str = "advection",
+    tolerance_m: float = 1e-6,
+    diagnostic_dir: str = "marker_barrier_debug",
+) -> None:
+    """Validate swept marker paths AND the proposed connected perimeter.
+
+    This method requires one-to-one marker identity. Call only before/after
+    advection, NOT after insertion or deletion of marker vertices.
+    """
+    from shapely.geometry import LineString, Point
+    if barrier_geometry is None or barrier_geometry.is_empty:
+        return
+    a = np.column_stack((np.asarray(x_old), np.asarray(y_old)))
+    b = np.column_stack((np.asarray(x_new), np.asarray(y_new)))
+    if a.shape != b.shape:
+        raise ValueError("Marker correspondence changed; use boundary-only validation")
+    for i, (p0, p1) in enumerate(zip(a, b)):
+        segment = LineString([p0, p1]) if not np.array_equal(p0, p1) else Point(*p1)
+        clipped = segment.intersection(barrier_geometry)
+        if clipped.length > tolerance_m or barrier_geometry.contains(Point(*p1)):
+            reason = (f"{phase}: marker {i} crossed non-burnable fuel "
+                      f"at time {time_min}; overlap={clipped.length:.6f} m")
+            _save_barrier_diagnostic((x_old, y_old), (x_new, y_new),
+                                     clipped, reason=reason, phase=phase,
+                                     time_min=time_min,
+                                     diagnostic_dir=diagnostic_dir)
+            raise MarkerBarrierError(reason)
+    validate_marker_boundary(x_new, y_new, barrier_geometry,
+                             time_min=time_min, phase=phase,
+                             tolerance_m=tolerance_m,
+                             diagnostic_dir=diagnostic_dir)
+
+
+def _snapshot_fire_geometry(rings, barrier_geometry=None):
+    """Build complete Polygon/MultiPolygon for optional *export-only* history.
+
+    Subtracting obstacles is for area accounting and hole preservation in
+    exports. It does NOT correct trajectories or implement inner-ring evolution.
+    """
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    polygons = []
+    for x, y in rings:
+        polygon = Polygon(np.column_stack((x, y)))
+        if not polygon.is_valid:
+            raise ValueError("Cannot export invalid marker polygon as burned geometry")
+        polygons.append(polygon)
+    geom = unary_union(polygons)
+    if barrier_geometry is not None and not barrier_geometry.is_empty:
+        geom = geom.difference(barrier_geometry)
+    return geom
 
 
 def _smooth_ring_local_xy(
@@ -395,6 +569,7 @@ class FireParameterGrid:
     bros: np.ndarray
     fros: np.ndarray
     raz: np.ndarray
+    nonfuel_mask: np.ndarray | None = None
     
     def __post_init__(self):
         """Validate array shapes and compute grid parameters."""
@@ -402,6 +577,23 @@ class FireParameterGrid:
         assert self.ros.shape == self.bros.shape == self.fros.shape == self.raz.shape
         
         self.nt, self.ny, self.nx = self.ros.shape
+        
+        #Validate the optional categorical non-fuel mask
+        if self.nonfuel_mask is not None:
+
+            self.nonfuel_mask = np.asarray(
+                self.nonfuel_mask,
+                dtype=bool,
+            )
+
+            if self.nonfuel_mask.shape != (
+                self.ny, self.nx
+            ):
+                raise ValueError(
+                    "nonfuel_mask shape must match "
+                    f"ROS spatial shape {(self.ny, self.nx)}; "
+                    f"received {self.nonfuel_mask.shape}"
+                )
         
         self.x_min = float(self.x_coords.min())
         self.x_max = float(self.x_coords.max())
@@ -420,6 +612,79 @@ class FireParameterGrid:
         else:
             self.dy_abs = self.dy
     
+    
+    def is_burnable_at(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Test whether coordinates lie inside burnable cells.
+
+        Uses nearest-cell lookup for categorical fuel classes.
+        Coordinates must be in the same projected CRS as
+        the parameter grid.
+
+        This method does not test movement trajectories.
+        """
+
+        x, y = np.broadcast_arrays(
+            np.asarray(x, dtype=float),
+            np.asarray(y, dtype=float),
+        )
+
+        if self.nonfuel_mask is None:
+            return np.ones(x.shape, dtype=bool)
+
+        # Grid coordinates describe cell centres.
+        # Signed spacing handles both ascending and
+        # descending y coordinates.
+        col_f = (
+            (x - float(self.x_coords[0]))
+            / float(self.x_coords[1] - self.x_coords[0])
+        )
+
+        row_f = (
+            (y - float(self.y_coords[0]))
+            / float(self.y_coords[1] - self.y_coords[0])
+        )
+
+        finite = np.isfinite(col_f) & np.isfinite(row_f)
+
+        inside = (
+            finite
+            & (col_f >= -0.5)
+            & (col_f < self.nx - 0.5)
+            & (row_f >= -0.5)
+            & (row_f < self.ny - 0.5)
+        )
+
+        safe_col = np.where(finite, col_f, 0.0)
+        safe_row = np.where(finite, row_f, 0.0)
+
+        col = np.clip(
+            np.floor(safe_col + 0.5).astype(int),
+            0,
+            self.nx - 1,
+        )
+
+        row = np.clip(
+            np.floor(safe_row + 0.5).astype(int),
+            0,
+            self.ny - 1,
+        )
+
+        return inside & ~self.nonfuel_mask[row, col]
+
+    
+    def get_barrier_geometry(self):
+        """Return cached polygonized nonfuel_mask for CPU diagnostics."""
+        if self.nonfuel_mask is None:
+            return None
+        if not hasattr(self, "_barrier_geometry_cache"):
+            self._barrier_geometry_cache = _barrier_geometry_from_grid(self)
+        return self._barrier_geometry_cache
+
     def _bilinear_interpolate(
         self,
         field: np.ndarray,
@@ -528,6 +793,14 @@ class FireParameterGrid:
         fros = self._bilinear_interpolate(self.fros[t_index], x, y)
         raz = self._bilinear_interpolate(self.raz[t_index], x, y)
         
+        if self.nonfuel_mask is not None:
+
+            burnable = self.is_burnable_at(x, y)
+
+            ros = np.where(burnable, ros, 0.0)
+            bros = np.where(burnable, bros, 0.0)
+            fros = np.where(burnable, fros, 0.0)
+
         return ros, bros, fros, raz
 
 
@@ -951,38 +1224,108 @@ def create_initial_perimeter(
 
 @dataclass
 class FirePerimeterHistory:
-    """Container for fire perimeter evolution history."""
-    
-    perimeters: list[tuple[np.ndarray, np.ndarray]]
+    """Perimeter history for one or several simultaneous ignition fronts.
+
+    Legacy ``perimeters`` entries remain (x, y) tuples for a single front.
+    In multiple-ignition runs, entries are None while separate fronts exist.
+    Use ``get_fronts(i)`` or ``fronts_by_time`` in those cases: a disconnected
+    fire must never be falsely serialized as one closed ring.
+    """
+
+    perimeters: list[tuple[np.ndarray, np.ndarray] | None]
     times: list[float]
-    
+    fronts_by_time: list[list[tuple[np.ndarray, np.ndarray]]] | None = None
+    merger_events: list[dict] = field(default_factory=list)
+    topology_repairs: list[dict] = field(default_factory=list)
+    burned_geometries: list | None = None  # Optional full Polygon/MultiPolygon snapshots
+
     @property
     def n_steps(self) -> int:
-        """Number of stored time steps."""
-        return len(self.perimeters)
-    
+        return len(self.times)
+
+    def get_fronts(self, index: int) -> list[tuple[np.ndarray, np.ndarray]]:
+        """All exterior closed rings at a stored time (copies)."""
+        if self.fronts_by_time is None:
+            perimeter = self.perimeters[index]
+            rings = [] if perimeter is None else [perimeter]
+        else:
+            rings = self.fronts_by_time[index]
+        return [(x.copy(), y.copy()) for x, y in rings]
+
     def get_perimeter(self, index: int) -> tuple[np.ndarray, np.ndarray]:
-        """Get perimeter at given index."""
-        return self.perimeters[index]
-    
+        """Legacy single-ring accessor; reject ambiguous multi-ring time steps."""
+        fronts = self.get_fronts(index)
+        if len(fronts) != 1:
+            raise ValueError(
+                f"Snapshot {index} has {len(fronts)} distinct fire fronts. "
+                "Use get_fronts(index), not get_perimeter(index)."
+            )
+        return fronts[0]
+
     def get_final_perimeter(self) -> tuple[np.ndarray, np.ndarray]:
-        """Get the final perimeter."""
-        return self.perimeters[-1] if self.perimeters else (np.array([]), np.array([]))
-    
+        if not self.times:
+            return np.array([]), np.array([])
+        return self.get_perimeter(-1)
+
+    def get_burned_geometry(self, index: int):
+        """Return exact saved geometry when available, or legacy ring union."""
+        if self.burned_geometries is not None:
+            return self.burned_geometries[index]
+        return _snapshot_fire_geometry(self.get_fronts(index))
+
     def compute_areas(self) -> np.ndarray:
-        """Compute area enclosed by each perimeter."""
-        areas = []
-        for x, y in self.perimeters:
-            # Shoelace formula
-            area = 0.5 * np.abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-            areas.append(area)
-        return np.array(areas)
+        """Return burned area, honoring optional hole-bearing geometries."""
+        if self.burned_geometries is not None:
+            return np.asarray([float(g.area) for g in self.burned_geometries])
+        # Legacy fallback: original exterior-ring shoelace calculation.
+        result = []
+        for i in range(self.n_steps):
+            total = 0.0
+            for x, y in self.get_fronts(i):
+                xx = np.asarray(x) - x[0]
+                yy = np.asarray(y) - y[0]
+                total += 0.5 * abs(np.dot(xx, np.roll(yy, -1))
+                                   - np.dot(yy, np.roll(xx, -1)))
+            result.append(total)
+        return np.asarray(result, dtype=float)
+
+    def to_geodataframe(self, crs=None):
+        """One row per active exterior ring at each stored time.
+
+        Requires GeoPandas and Shapely. Save with ``gdf.to_file(path,
+        driver='GPKG')``. If burned_geometries is provided, holes and
+        separate polygon components are preserved during export. Legacy
+        exterior-only history still lacks hole-aware propagation.
+        """
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+
+        records = []
+        if self.burned_geometries is not None:
+            if len(self.burned_geometries) != len(self.times):
+                raise ValueError("Burned geometry history and time history have different lengths")
+            for i, (t, geom) in enumerate(zip(self.times, self.burned_geometries)):
+                for j, part in enumerate(_geometry_polygons(geom)):
+                    records.append({
+                        "step": i, "t_min": float(t), "front_id": j,
+                        "area_m2": float(part.area), "geometry": part,
+                    })
+        else:
+            for i, t in enumerate(self.times):
+                for j, (x, y) in enumerate(self.get_fronts(i)):
+                    poly = Polygon(np.column_stack((x, y)))
+                    records.append({
+                        "step": i, "t_min": float(t), "front_id": j,
+                        "area_m2": float(poly.area), "geometry": poly,
+                    })
+        return gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
+
 
 
 def simulate_fire_spread(
     param_grid: FireParameterGrid,
-    x_ignition: float,
-    y_ignition: float,
+    x_ignition: float | None = None,
+    y_ignition: float | None = None,
     dt: float = 1.0,
     n_vertices: int = 300,
     initial_radius: float = 0.5,
@@ -1005,6 +1348,10 @@ def simulate_fire_spread(
     max_move_fraction: float = 0.5,
     # Backward-compatibility: older call sites may pass config objects here
     sim_config: object | None = None,
+    ignition_points: Sequence[tuple[float, float]] | None = None,
+    barrier_mode: str = "off",  # "off" (legacy) or "raise" (fail-fast diagnostic)
+    barrier_debug_dir: str = "marker_barrier_debug",
+    export_burned_geometry: bool = False,
     **kwargs,
 ) -> FirePerimeterHistory:
     """
@@ -1070,6 +1417,15 @@ def simulate_fire_spread(
     max_move_fraction : float
         Fraction of target spacing allowed as max marker movement per sub-step.
 
+    barrier_mode : {"off", "raise"}
+        Opt-in fail-fast diagnostics for trajectories and perimeter crossings.
+        A crossing raises MarkerBarrierError and saves WKT diagnostics.
+        It does not perform physical obstacle collision resolution.
+    barrier_debug_dir : str
+        Directory receiving first-failure WKT and JSON records.
+    export_burned_geometry : bool
+        Store Polygon/MultiPolygon snapshots, subtracting the non-fuel mask
+        for area accounting only; this does not repair front propagation.
     sim_config : object, optional
         Backward-compatibility parameter. Some call sites pass a simulation config object;
         it is not used directly by this function.
@@ -1084,7 +1440,58 @@ def simulate_fire_spread(
     Notes
     -----
     `sim_config` and `**kwargs` are accepted for backward compatibility and ignored.
+    `ignition_points=[(x1,y1),(x2,y2),...]` enables simultaneous ignitions
+    on a projected metric grid. Multi-front history uses `get_fronts(i)`.
     """
+    # Opt-in barrier diagnostics keep legacy physics untouched by default.
+    if barrier_mode not in {"off", "raise"}:
+        raise ValueError("barrier_mode must be 'off' or 'raise'")
+    if barrier_mode != "off" and param_grid.nonfuel_mask is None:
+        raise ValueError("barrier_mode='raise' requires nonfuel_mask on FireParameterGrid")
+    if barrier_mode == "raise" and is_geographic:
+        raise ValueError("Barrier diagnostics require projected metric coordinates")
+    barrier_geometry = (param_grid.get_barrier_geometry()
+                        if (barrier_mode == "raise" or export_burned_geometry)
+                        else None)
+    barrier_interior = (barrier_geometry.buffer(-1e-7)
+                        if barrier_geometry is not None and not barrier_geometry.is_empty
+                        else None)
+    if export_burned_geometry and barrier_mode == "off":
+        logger.warning("Export mask removes barriers in GeoPackage only; it does NOT fix front propagation")
+
+    # Multiple ignitions are an explicit opt-in. Preserve the legacy
+    # single-ignition numerical path exactly when not requested.
+    if ignition_points is not None:
+        points = np.asarray(ignition_points, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 1:
+            raise ValueError("ignition_points must have shape (N, 2), N >= 1")
+        if not np.isfinite(points).all():
+            raise ValueError("Ignition coordinates must be finite")
+        if len(points) == 1:
+            x_ignition, y_ignition = map(float, points[0])
+        else:
+            return _simulate_multiple_ignitions(
+                param_grid=param_grid,
+                ignition_points=[tuple(map(float, pt)) for pt in points],
+                dt=dt, n_vertices=n_vertices, initial_radius=initial_radius,
+                store_every=store_every, max_steps=max_steps,
+                use_markers=use_markers, marker_epsilon=marker_epsilon,
+                min_ros=min_ros, is_geographic=is_geographic,
+                advection_integrator=advection_integrator,
+                resample_spacing=resample_spacing,
+                insert_factor=insert_factor, delete_factor=delete_factor,
+                smoothing_weight=smoothing_weight,
+                smoothing_iters=smoothing_iters,
+                redistribute_every=redistribute_every,
+                max_substeps=max_substeps, max_move_fraction=max_move_fraction,
+                barrier_mode=barrier_mode, barrier_interior=barrier_interior,
+                barrier_geometry=barrier_geometry,
+                barrier_debug_dir=barrier_debug_dir,
+                export_burned_geometry=export_burned_geometry,
+            )
+    if x_ignition is None or y_ignition is None:
+        raise ValueError("Pass x_ignition and y_ignition, or ignition_points")
+
     # Handle geographic coordinates
     if is_geographic:
         if center_latitude is None:
@@ -1119,10 +1526,16 @@ def simulate_fire_spread(
     else:
         marker_epsilon_coord = marker_epsilon
     
-    # Storage
+    # Validate ignition footprint before starting a constrained experiment.
+    if barrier_mode == "raise":
+        validate_marker_boundary(x, y, barrier_interior,
+                                 time_min=0.0, phase="initial_front",
+                                 diagnostic_dir=barrier_debug_dir)
     history = FirePerimeterHistory(
         perimeters=[(x.copy(), y.copy())],
         times=[0.0],
+        burned_geometries=([_snapshot_fire_geometry([(x, y)], barrier_geometry)]
+                           if export_burned_geometry else None),
     )
     
     # Number of time steps
@@ -1175,13 +1588,14 @@ def simulate_fire_spread(
             a, b, c, theta = ros_to_ellipse_params(ros_u, bros_u, fros_u, raz)
             x_t, y_t = richards_velocity(xq, yq, a, b, c, theta)
 
-            # Marker method: freeze inactive vertices
+            # Preserve per-vertex extinction and enforce the categorical
+            # non-fuel mask after continuous ROS interpolation.
+            allowed = np.asarray(ros_m >= min_ros, dtype=bool)
+            if param_grid.nonfuel_mask is not None:
+                allowed &= param_grid.is_burnable_at(xq, yq)
             if use_markers:
-                active = compute_active_vertices(xq, yq, marker_epsilon_coord)
-                x_t[~active] = 0.0
-                y_t[~active] = 0.0
-
-            return x_t, y_t
+                allowed &= compute_active_vertices(xq, yq, marker_epsilon_coord)
+            return np.where(allowed, x_t, 0.0), np.where(allowed, y_t, 0.0)
 
         # Determine target spacing for adaptive sub-stepping and redistribution.
         if resample_spacing is not None and resample_spacing > 0:
@@ -1191,6 +1605,14 @@ def simulate_fire_spread(
 
         # Save last known good coordinates for NaN recovery
         x_prev, y_prev = x.copy(), y.copy()
+
+        def _check_advection(old_x, old_y, new_x, new_y, sub_index, phase):
+            if barrier_mode == "raise":
+                validate_marker_barrier_crossings(
+                    old_x, old_y, new_x, new_y, barrier_interior,
+                    time_min=(step + (sub_index + 1) / max(nsub, 1)) * dt,
+                    phase=phase, diagnostic_dir=barrier_debug_dir,
+                )
 
         if integrator == "heun":
             # Adaptive sub-stepping to limit movement per substep (Heun)
@@ -1207,7 +1629,10 @@ def simulate_fire_spread(
 
             subdt = dt / nsub
             for isub in range(nsub):
+                xo, yo = x.copy(), y.copy()
                 x, y = _heun_step_xy(x, y, subdt, _vel_from_grid)
+                if np.all(np.isfinite(x)) and np.all(np.isfinite(y)):
+                    _check_advection(xo, yo, x, y, isub, "heun")
                 if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
                     logger.warning(
                         f"Non-finite coordinates at step {step}, substep {isub}, "
@@ -1233,7 +1658,10 @@ def simulate_fire_spread(
 
             # Perform RK4 integration with sub-stepping
             for isub in range(nsub):
+                xo, yo = x.copy(), y.copy()
                 x, y = _rk4_step_xy(x, y, subdt, _vel_from_grid)
+                if np.all(np.isfinite(x)) and np.all(np.isfinite(y)):
+                    _check_advection(xo, yo, x, y, isub, "rk4")
                 if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
                     logger.warning(f"Non-finite coordinates at step {step}, substep {isub}, reverting to previous")
                     x, y = x_prev.copy(), y_prev.copy()
@@ -1260,6 +1688,11 @@ def simulate_fire_spread(
                 x, y, dt, _vel_from_grid, n_base,
             )
 
+            if barrier_mode == "raise" and np.isfinite(x).all() and np.isfinite(y).all():
+                validate_marker_barrier_crossings(
+                    x_prev, y_prev, x, y, barrier_interior,
+                    time_min=(step+1)*dt, phase="euler_extrap",
+                    diagnostic_dir=barrier_debug_dir)
             if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
                 logger.warning(
                     f"Non-finite coordinates at step {step} (euler_extrap), "
@@ -1274,6 +1707,11 @@ def simulate_fire_spread(
             # ---------------------------------------------------------------
             x, y = _implicit_newton_step_xy(x, y, dt, _vel_from_grid)
 
+            if barrier_mode == "raise" and np.isfinite(x).all() and np.isfinite(y).all():
+                validate_marker_barrier_crossings(
+                    x_prev, y_prev, x, y, barrier_interior,
+                    time_min=(step+1)*dt, phase="implicit",
+                    diagnostic_dir=barrier_debug_dir)
             if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
                 logger.warning(
                     f"Non-finite coordinates at step {step} (implicit newton), "
@@ -1299,9 +1737,12 @@ def simulate_fire_spread(
             subdt = dt / nsub
 
             for isub in range(nsub):
+                xo, yo = x.copy(), y.copy()
                 x_t, y_t = _vel_from_grid(x, y)
                 x = x + subdt * x_t
                 y = y + subdt * y_t
+                if np.isfinite(x).all() and np.isfinite(y).all():
+                    _check_advection(xo, yo, x, y, isub, "euler")
 
                 if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
                     logger.warning(f"Non-finite coordinates at step {step}, substep {isub}, reverting to previous")
@@ -1329,6 +1770,12 @@ def simulate_fire_spread(
                 # Unlike Chaikin smoothing, this does not materially shrink the perimeter.
                 if smoothing_iters and int(smoothing_iters) > 0 and smoothing_weight and float(smoothing_weight) > 0:
                     x, y = _smooth_ring_local_xy(x, y, w=float(smoothing_weight), n_iter=int(smoothing_iters))
+                # Vertex count/order may change: check ONLY the new boundary.
+                if barrier_mode == "raise":
+                    validate_marker_boundary(
+                        x, y, barrier_interior,
+                        time_min=(step+1)*dt, phase="redistribution",
+                        diagnostic_dir=barrier_debug_dir)
 
         # Log progress at intervals
         if (step + 1) % 100 == 0:
@@ -1346,9 +1793,420 @@ def simulate_fire_spread(
         if (step + 1) % store_every == 0:
             history.perimeters.append((x.copy(), y.copy()))
             history.times.append((step + 1) * dt)
+            if history.burned_geometries is not None:
+                history.burned_geometries.append(
+                    _snapshot_fire_geometry([(x, y)], barrier_geometry))
 
     logger.info(f"Simulation complete: {len(history.perimeters)} perimeters stored")
 
+    return history
+
+
+# =============================================================================
+# Multiple simultaneous ignitions and fire-front mergers (CPU marker solver)
+# =============================================================================
+
+# Notes on numerical scope:
+# * Each currently disjoint fire is a separate, counter-clockwise marker ring.
+# * When burned polygons overlap, Shapely's geometric union removes interior
+#   front segments. The union exterior is resampled for continued advection.
+# * Existing per-ring integration routines, including forward Euler, are reused.
+# * Geometric union is a topology operation, NOT an additional burn rate.
+# * No rasterization is involved. Self-intersections require Shapely buffer(0)
+#   repair plus preservation of the previous burned area. This introduces a
+#   topology approximation and is logged. Hole-bearing fires are unsupported.
+# * The topology operation is nondifferentiable; it does not affect the separate
+#   JAX advection routines below.
+
+
+def _require_shapely():
+    try:
+        import shapely  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Multiple-front merging requires Shapely. Install with pip install shapely."
+        ) from exc
+
+
+def _geometry_polygons(geom):
+    """Flatten Polygon, MultiPolygon, or GeometryCollection to polygons."""
+    if geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+        parts = []
+        for item in geom.geoms:
+            parts.extend(_geometry_polygons(item))
+        return parts
+    return []
+
+
+def _validated_polygon(ring):
+    """Build a valid marker polygon, reporting topological repairs explicitly."""
+    from shapely.geometry import Polygon
+    from shapely.validation import explain_validity
+    from shapely.ops import unary_union
+
+    x, y = ring
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if (len(x) < 4 or len(y) != len(x)
+            or not np.isfinite(x).all() or not np.isfinite(y).all()):
+        raise ValueError("A marker ring is too short or contains non-finite coordinates")
+    poly = Polygon(np.column_stack((x, y)))
+    if poly.area <= 0:
+        raise ValueError("Degenerate zero-area marker perimeter")
+    if not poly.is_valid:
+        # Richards propagation near a freshly merged cusp may self-cross.
+        # Use geometry repair and preserve the PREVIOUS burned region in the
+        # caller; otherwise repairing a bowtie could artificially unburn land.
+        why = explain_validity(poly)
+        logger.warning("Repairing self-intersecting ring: %s", why)
+        repaired = poly.buffer(0)
+        parts = _geometry_polygons(repaired)
+        if not parts:
+            raise ValueError("Self-intersection repair produced no polygons: " + why)
+        poly = unary_union(parts)
+        if not poly.is_valid:
+            raise ValueError("Unable to repair invalid marker front: " + why)
+    for part in _geometry_polygons(poly):
+        if part.interiors:
+            
+            from pathlib import Path
+            from uuid import uuid4
+            
+            debug_dir = Path("marker_topology_debug")
+            debug_dir.mkdir(exist_ok=True)
+            
+            run_id = uuid4().hex[:8]
+            
+            original = Polygon(np.column_stack((x, y)))
+            
+            original_path = debug_dir / (
+                f"invalid_ring_{run_id}.wkt"   
+            )
+            repaired_path = debug_dir / (
+                f"repaired_polygon_{run_id}.wkt"
+            )
+            original_path.write_text(
+                original.wkt,
+                encoding="utf-8",
+            )
+            repaired_path.write_text(
+                poly.wkt,
+                encoding="utf-8",
+            )
+            hole_areas = [
+                Polygon(ring).area
+                for ring in part.interiors
+            ]
+            
+            logger.error(
+                "Topology failure: %d holes; "
+                "hole areas (m2): %s",
+                len(part.interiors),
+                hole_areas,
+            )
+            
+            logger.error(
+                "Invalid ring saved to: %s",
+                original_path.resolve()    
+            )
+            
+            logger.error(
+                "Repaired polygon saved to: %s",
+                repaired_path.resolve()
+            )  
+            
+            raise ValueError(
+                "Topology repair produced an unburned hole. "
+                "Diagnostic geometries saved."
+            )    
+            
+    return poly
+
+
+def _ring_from_polygon(poly, spacing, min_vertices=32, max_vertices=20000):
+    """Resample the exterior into uniformly spaced CCW markers."""
+    from shapely.geometry.polygon import orient
+
+    if not poly.is_valid or poly.is_empty or poly.area <= 0:
+        raise ValueError("Cannot resample invalid/empty fire polygon")
+    if poly.interiors:
+        raise ValueError(
+            "Union produced an unburned island/hole; hole-aware ring evolution "
+            "is not implemented. Refusing to discard the interior boundary."
+        )
+    poly = orient(poly, sign=1.0)
+    boundary = poly.exterior
+    perimeter = float(boundary.length)
+    n = int(np.clip(np.ceil(perimeter / spacing), min_vertices, max_vertices))
+    dists = np.arange(n, dtype=float) * (perimeter / n)
+    coords = np.array([[boundary.interpolate(float(d)).x,
+                        boundary.interpolate(float(d)).y] for d in dists])
+    return coords[:, 0], coords[:, 1]
+
+
+def _merge_intersecting_fronts(rings, spacing, n_vertices, previous_geometry=None):
+    """Remove internal boundaries when separate burned polygons overlap.
+
+    Returns (rings, did_merge, union_geometry). The original rings remain
+    untouched if there is no merger (to avoid changing marker discretization).
+    """
+    from shapely.ops import unary_union
+
+    from shapely.geometry import Polygon
+    had_repair = any(not Polygon(np.column_stack(ring)).is_valid for ring in rings)
+    polygons = [_validated_polygon(ring) for ring in rings]
+    union = unary_union(polygons)
+    if had_repair and previous_geometry is not None:
+        # Repair can otherwise delete a sliver that was already burned.
+        union = unary_union([previous_geometry, union])
+    parts = sorted(_geometry_polygons(union), key=lambda g: (-g.area, g.centroid.x))
+    if len(parts) > len(rings):
+        raise ValueError("Topology unexpectedly fragmented an existing fire front")
+    if not parts:
+        raise ValueError("No valid fire polygons remain after geometric union")
+    for part in parts:
+        if part.interiors:
+            raise ValueError(
+                "Front union formed an unburned island. Inner-ring propagation "
+                "must be added before simulating this topology."
+            )
+    if len(parts) == len(rings) and not had_repair:
+        return rings, False, union
+
+    # Formerly overlapping interiors have become inactive. Only true exterior
+    # boundaries are retained and resampled for further Richards advection.
+    result = [_ring_from_polygon(part, spacing,
+                                min_vertices=max(32, min(n_vertices // 2, 100)),
+                                max_vertices=max(20000, 10 * n_vertices))
+              for part in parts]
+    return result, len(parts) < len(rings), union
+
+
+def _copy_rings(rings):
+    return [(x.copy(), y.copy()) for x, y in rings]
+
+
+def _append_front_snapshot(history, rings, time, barrier_geometry=None):
+    copy = _copy_rings(rings)
+    history.times.append(float(time))
+    history.fronts_by_time.append(copy)
+    # Explicitly reject the legacy representation for disconnected fires.
+    history.perimeters.append(copy[0] if len(copy) == 1 else None)
+    if history.burned_geometries is not None:
+        history.burned_geometries.append(
+            _snapshot_fire_geometry(copy, barrier_geometry))
+
+
+def _simulate_multiple_ignitions(
+    *, param_grid, ignition_points, dt, n_vertices, initial_radius,
+    store_every, max_steps, use_markers, marker_epsilon, min_ros, is_geographic,
+    advection_integrator, resample_spacing, insert_factor, delete_factor,
+    smoothing_weight, smoothing_iters, redistribute_every,
+    max_substeps, max_move_fraction,
+    barrier_mode="off", barrier_interior=None, barrier_geometry=None,
+    barrier_debug_dir="marker_barrier_debug", export_burned_geometry=False,
+):
+    """Evolve multiple circular ignitions, resolving front collisions by union.
+
+    The user must explicitly pass ignition_points through simulate_fire_spread().
+    This is intended for controlled numerical tests on projected metre grids.
+    """
+    _require_shapely()
+    if not use_markers:
+        raise ValueError("Multiple ignition front merging requires use_markers=True")
+    if is_geographic:
+        raise ValueError(
+            "Multiple-ignition experiments require a projected metre-based CRS. "
+            "Reproject DEM, fuel and ignition points consistently before running."
+        )
+    if dt <= 0 or store_every < 1 or initial_radius <= 0 or n_vertices < 8:
+        raise ValueError("Require dt>0, store_every>=1, radius>0, n_vertices>=8")
+    if max_substeps < 1 or not (0 < max_move_fraction <= 1):
+        raise ValueError("max_substeps>=1 and max_move_fraction in (0,1] required")
+    if not (0 < insert_factor and 0 < delete_factor < insert_factor):
+        raise ValueError("Invalid marker insertion/deletion factors")
+    if smoothing_iters < 0 or not (0 <= smoothing_weight <= 0.5):
+        raise ValueError("Invalid smoothing settings")
+    integrator = (advection_integrator or "euler").strip().lower()
+    if integrator not in {"euler", "heun", "rk4", "euler_extrap", "implicit"}:
+        raise ValueError(f"Unsupported multi-front integrator: {integrator}")
+    if (resample_spacing is None or resample_spacing <= 0):
+        raise ValueError(
+            "For multi-front runs, set resample_spacing explicitly in metres "
+            "(e.g., 1.0 or 2.0 on a 2 m grid)."
+        )
+    spacing = float(resample_spacing)
+    if not np.isfinite(spacing) or spacing <= 0:
+        raise ValueError("resample_spacing must be finite and > 0")
+    points = np.asarray(ignition_points, dtype=float)
+    for idx, (px, py) in enumerate(points):
+        if not (param_grid.x_min + initial_radius < px < param_grid.x_max - initial_radius
+                and param_grid.y_min + initial_radius < py < param_grid.y_max - initial_radius):
+            raise ValueError(
+                f"Ignition {idx+1} at ({px},{py}) is outside the safe grid extent."
+            )
+
+    rings = [create_initial_perimeter(float(px), float(py),
+                                      float(initial_radius), int(n_vertices))
+             for px, py in points]
+    history = FirePerimeterHistory(
+        perimeters=[], times=[], fronts_by_time=[],
+        burned_geometries=[] if export_burned_geometry else None)
+    for ring in rings:
+        if barrier_mode == "raise":
+            validate_marker_boundary(*ring, barrier_interior,
+                                     time_min=0.0, phase="initial_front",
+                                     diagnostic_dir=barrier_debug_dir)
+    rings, merged, _ = _merge_intersecting_fronts(rings, spacing, n_vertices)
+    if merged:
+        history.merger_events.append({
+            "time_min": 0.0, "fronts_before": len(points), "fronts_after": len(rings),
+        })
+    _append_front_snapshot(history, rings, 0.0, barrier_geometry)
+
+    n_steps = param_grid.nt if max_steps is None else min(int(max_steps), param_grid.nt)
+    logger.info("Multi-ignition marker run: %d ignitions, %d steps, dt=%.4f min, %s",
+                len(points), n_steps, dt, integrator)
+
+    for step in range(n_steps):
+        # Find max velocity across all active rings for topology-safe substeps.
+        vmax = 0.0
+        for x, y in rings:
+            ros, bros, fros, raz = param_grid.sample_at(step, x, y)
+            if np.any(ros >= min_ros):
+                a, b, c, theta = ros_to_ellipse_params(ros, bros, fros, raz)
+                vx, vy = richards_velocity(x, y, a, b, c, theta)
+                vmax = max(vmax, float(np.max(np.hypot(vx, vy))))
+        if vmax < min_ros:
+            logger.info("Fire extinguished at step %d", step)
+            break
+
+        # This threshold limits distance travelled by a marker before checking
+        # whether fronts have crossed. NEVER silently cap needed substeps.
+        required = max(1, int(np.ceil(vmax * dt / (max_move_fraction * spacing))))
+        if required > max_substeps:
+            raise ValueError(
+                f"Need {required} topology substeps but max_substeps={max_substeps} "
+                f"at step {step}. Reduce dt or raise max_substeps."
+            )
+        sub_dt = dt / required
+
+        for sub in range(required):
+            from shapely.ops import unary_union
+            previous_geometry = unary_union([_validated_polygon(r) for r in rings])
+            new_rings = []
+            for x, y in rings:
+                # Each component is a CCW outer ring; the union operation
+                # removes inactive, intersecting interior segments. The
+                # original per-ring winding-number test does not detect
+                # collisions between separate rings and is not used here.
+                def vel_fn(xq, yq):
+                    ros, bros, fros, raz = param_grid.sample_at(step, xq, yq)
+                    a, b, c, theta = ros_to_ellipse_params(ros, bros, fros, raz)
+                    vx, vy = richards_velocity(xq, yq, a, b, c, theta)
+                    mask = np.asarray(ros) >= min_ros
+                    return np.where(mask, vx, 0.0), np.where(mask, vy, 0.0)
+
+                if integrator == "euler":
+                    vx, vy = vel_fn(x, y)
+                    xn, yn = x + sub_dt * vx, y + sub_dt * vy
+                elif integrator == "heun":
+                    xn, yn = _heun_step_xy(x, y, sub_dt, vel_fn)
+                elif integrator == "rk4":
+                    xn, yn = _rk4_step_xy(x, y, sub_dt, vel_fn)
+                elif integrator == "euler_extrap":
+                    xn, yn, _ = _euler_extrapolation_step_xy(
+                        x, y, sub_dt, vel_fn, n_base=1)
+                else:
+                    xn, yn = _implicit_newton_step_xy(x, y, sub_dt, vel_fn)
+                if barrier_mode == "raise" and np.isfinite(xn).all() and np.isfinite(yn).all():
+                    when = step * dt + (sub + 1) * sub_dt
+                    validate_marker_barrier_crossings(
+                        x, y, xn, yn, barrier_interior,
+                        time_min=when, phase="multi_" + integrator,
+                        diagnostic_dir=barrier_debug_dir)
+                new_rings.append((xn, yn))
+
+            # Do not let the legacy grid sampler silently clamp fire markers
+            # at the edges of the computational domain.
+            for xx, yy in new_rings:
+                if (np.min(xx) < param_grid.x_min or np.max(xx) > param_grid.x_max
+                        or np.min(yy) < param_grid.y_min or np.max(yy) > param_grid.y_max):
+                    raise ValueError(
+                        "A fire front reached the parameter-grid boundary. "
+                        "Use a larger domain or end the simulation earlier."
+                    )
+            # Track numerical topology repairs separately from true mergers.
+            from shapely.geometry import Polygon
+            when = step * dt + (sub + 1) * sub_dt
+            if any(not Polygon(np.column_stack(r)).is_valid for r in new_rings):
+                history.topology_repairs.append({"time_min": float(when),
+                                                 "reason": "self_intersection"})
+            before = len(new_rings)
+            rings, did_merge, _ = _merge_intersecting_fronts(
+                new_rings, spacing, n_vertices, previous_geometry=previous_geometry)
+            if barrier_mode == "raise":
+                for xx, yy in rings:
+                    validate_marker_boundary(
+                        xx, yy, barrier_interior,
+                        time_min=step * dt + (sub + 1) * sub_dt,
+                        phase="multi_union", diagnostic_dir=barrier_debug_dir)
+            if did_merge:
+                when = step * dt + (sub + 1) * sub_dt
+                event = {"time_min": float(when),
+                         "fronts_before": before, "fronts_after": len(rings)}
+                history.merger_events.append(event)
+                logger.info("Fire fronts merged at %.4f min: %d -> %d",
+                            when, before, len(rings))
+
+        if (redistribute_every and int(redistribute_every) > 0
+                and (step + 1) % int(redistribute_every) == 0):
+            updated_rings = []
+            for x, y in rings:
+                x, y = _insert_delete_markers_by_spacing(
+                    x, y, spacing=spacing,
+                    insert_factor=insert_factor,
+                    delete_factor=delete_factor,
+                    max_n=max(20000, int(n_vertices * 10)),
+                    min_n=max(16, min(n_vertices // 2, 100)),
+                )
+                if smoothing_weight > 0 and smoothing_iters > 0:
+                    x, y = _smooth_ring_local_xy(
+                        x, y, w=smoothing_weight, n_iter=int(smoothing_iters))
+                if barrier_mode == "raise":
+                    validate_marker_boundary(
+                        x, y, barrier_interior,
+                        time_min=(step+1)*dt, phase="multi_redistribution",
+                        diagnostic_dir=barrier_debug_dir)
+                updated_rings.append((x, y))
+            # Smoothing can create an intersection; resolve again. Retain
+            # the pre-smoothing burned area if topology requires repair.
+            from shapely.ops import unary_union
+            previous_geometry = unary_union([_validated_polygon(r) for r in rings])
+            from shapely.geometry import Polygon
+            if any(not Polygon(np.column_stack(r)).is_valid for r in updated_rings):
+                history.topology_repairs.append({"time_min": float((step+1)*dt),
+                                                 "reason": "after_redistribution"})
+            before = len(updated_rings)
+            rings, did_merge, _ = _merge_intersecting_fronts(
+                updated_rings, spacing, n_vertices, previous_geometry=previous_geometry)
+            if did_merge:
+                when = (step + 1) * dt
+                history.merger_events.append({
+                    "time_min": float(when),
+                    "fronts_before": before, "fronts_after": len(rings)})
+                logger.info("Fire fronts merged after redistribution at %.4f min", when)
+
+        if (step + 1) % store_every == 0:
+            _append_front_snapshot(history, rings, (step + 1) * dt,
+                                   barrier_geometry)
+
+    logger.info("Multiple-front simulation complete: %d snapshots, %d merges, %d repairs",
+                history.n_steps, len(history.merger_events), len(history.topology_repairs))
     return history
 
 

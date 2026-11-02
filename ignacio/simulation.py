@@ -3,12 +3,17 @@ Fire simulation orchestration for Ignacio.
 
 This module provides the main entry points for running fire growth simulations,
 coordinating the terrain, weather, ignition, FBP, and spread components.
+
+Includes simultaneous multiple-ignition marker and level-set paths compatible
+with ignacio.spread.FirePerimeterHistory (fronts_by_time/get_fronts).
+Single-ignition behavior is preserved.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace, is_dataclass
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +21,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+from rasterio.enums import Resampling
 
 # Optional Shapely validity helpers (Shapely 2.0+)
 try:
@@ -26,7 +33,16 @@ except Exception:  # pragma: no cover
 from ignacio.config import IgnacioConfig
 from ignacio.fbp import compute_ros, compute_ros_components
 from ignacio.ignition import IgnitionPoint, IgnitionSet, generate_ignitions, save_ignitions
-from ignacio.io import RasterData, read_raster, read_raster_int, write_raster, write_vector, read_vector, rasterize_geometries
+from ignacio.io import (
+    RasterData,
+    read_raster,
+    read_raster_int,
+    write_raster,
+    write_vector,
+    read_vector,
+    rasterize_geometries,
+    reproject_raster,
+)
 from ignacio.spread import (
     FireParameterGrid,
     FirePerimeterHistory,
@@ -459,6 +475,116 @@ def untangle_history_perimeters(
 
 
 # =============================================================================
+# Multiple-front geometry and ignition source helpers
+# =============================================================================
+
+
+def _history_fronts(history: FirePerimeterHistory, index: int):
+    """Return all fronts, including a legacy single-front history."""
+    if hasattr(history, "get_fronts"):
+        return history.get_fronts(index)
+    p = history.perimeters[index]
+    return [] if p is None else [p]
+
+
+def _front_polygon(x: np.ndarray, y: np.ndarray) -> Polygon:
+    """Construct a valid projected-metre polygon without smoothing/area loss."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) < 3 or len(x) != len(y) or not (np.isfinite(x).all() and np.isfinite(y).all()):
+        raise ValueError("Invalid fire perimeter coordinates")
+    # Work in a local coordinate frame to avoid numerical cancellation in UTM.
+    x0, y0 = float(x[0]), float(y[0])
+    poly = Polygon(np.column_stack((x - x0, y - y0)))
+    if not poly.is_valid:
+        raise ValueError("Invalid marker perimeter: solver should repair topology before export")
+    if poly.is_empty or poly.area <= 0:
+        raise ValueError("Empty marker perimeter")
+    # Restore world coordinates and explicitly verify output geometry.
+    world_polygon = Polygon(np.column_stack((x, y)))
+    if not world_polygon.is_valid or world_polygon.is_empty:
+        raise ValueError("Fire perimeter became invalid in projected coordinates")
+    return world_polygon
+
+
+def _multi_geometry(history: FirePerimeterHistory, index: int):
+    """Dissolved burned geometry for a snapshot. Preserve disconnected fronts."""
+    polygons = [_front_polygon(x, y) for x, y in _history_fronts(history, index)]
+    if not polygons:
+        return None
+    return unary_union(polygons)
+
+
+def _file_ignition_positions(config: IgnacioConfig, terrain: TerrainGrids):
+    """For a simultaneous-ignition shapefile experiment, read ALL source features.
+
+    The legacy generate_ignitions() may sample input points according to
+    occurrence/iteration logic; a simultaneous-front test must not do so.
+    Returns None if not a multi-point shapefile.
+    """
+    source_type = str(getattr(config.ignition, "source_type", "")).lower()
+    if not source_type.endswith("shapefile"):
+        return None
+    path_value = getattr(config.ignition, "point_path", None)
+    if not path_value:
+        raise ValueError("ignition.point_path is empty")
+    path = Path(path_value)
+    if not path.is_file():
+        raise FileNotFoundError(f"Ignition shapefile not found: {path}")
+    gdf = gpd.read_file(path)
+    if len(gdf) < 2:
+        return None  # The original one-ignition pipeline stays unchanged.
+    if gdf.crs is None or terrain.crs is None:
+        raise ValueError("Both ignition shapefile and terrain require a defined CRS")
+    from pyproj import CRS
+    crs_obj = CRS.from_user_input(terrain.crs)
+    if not crs_obj.is_projected or not crs_obj.axis_info or not np.isclose(
+        crs_obj.axis_info[0].unit_conversion_factor, 1.0, atol=1e-9
+    ):
+        raise ValueError("Multiple ignitions require a projected metre-based terrain grid")
+    gdf = gdf.to_crs(terrain.crs)
+    if gdf.geometry.isna().any() or gdf.geometry.is_empty.any():
+        raise ValueError("Ignition shapefile contains empty geometries")
+    if not all(geom.geom_type == "Point" for geom in gdf.geometry):
+        raise ValueError("Simultaneous ignitions must be Point geometries")
+    positions = [(float(p.x), float(p.y)) for p in gdf.geometry]
+    if not np.isfinite(np.array(positions)).all() or len(set(positions)) != len(positions):
+        raise ValueError("Ignition positions must be finite and distinct")
+    logger.info("Read %d simultaneous ignitions directly from %s", len(positions), path)
+    return positions
+
+
+def _replace_ignitions_points(ignitions: IgnitionSet, positions):
+    """Update the ignition record collection to reflect the actual input points."""
+    points = list(getattr(ignitions, "points", []))
+    if not points:
+        # Fall back to the common IGNACIO ignition dataclass constructor.
+        # Fail clearly rather than saving an empty or invented ignition layer.
+        raise ValueError(
+            "generate_ignitions() returned no ignition template. "
+            "Inspect ignacio.ignition.IgnitionPoint before multi-front simulation."
+        )
+    template = points[0]
+    new_points = []
+    for x, y in positions:
+        if is_dataclass(template):
+            p = replace(template, x=x, y=y)
+        else:
+            p = copy.copy(template)
+            p.x, p.y = x, y
+        new_points.append(p)
+    try:
+        ignitions.points = new_points
+    except (AttributeError, TypeError):
+        if not is_dataclass(ignitions):
+            raise ValueError("IgnitionSet is immutable and cannot be reconstructed")
+        ignitions = replace(ignitions, points=new_points)
+    if len(ignitions.points) != len(positions):
+        raise ValueError("Failed to preserve all ignition points")
+    return ignitions
+
+
+# =============================================================================
 # Data Classes
 # =============================================================================
 
@@ -472,6 +598,7 @@ class FireResult:
     final_area_ha: float = 0.0
     final_perimeter_m: float = 0.0
     dur_min: float = 0.0
+    ignition_positions: list[tuple[float, float]] | None = None
     
     def get_final_polygon(self, output_crs: str, source_crs: str | None = None) -> gpd.GeoDataFrame:
         """Get final fire perimeter as GeoDataFrame.
@@ -484,6 +611,28 @@ class FireResult:
             CRS of the source coordinates. If different from output_crs,
             the polygon will be reprojected.
         """
+        # Multiple ignition histories can have several disconnected exterior
+        # rings. Never call the legacy get_final_perimeter() in that case.
+        if getattr(self.history, "fronts_by_time", None) is not None:
+            if not self.history.times:
+                return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
+            geom = _multi_geometry(self.history, -1)
+            if geom is None or geom.is_empty:
+                return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
+            gdf = gpd.GeoDataFrame({
+                "area_ha": [self.final_area_ha],
+                "perim_m": [self.final_perimeter_m],
+                "dur_min": [self.dur_min],
+                "cause": [self.ignition.cause],
+                "season": [self.ignition.season],
+                "iteration": [self.ignition.iteration],
+                "n_ignitions": [len(self.ignition_positions or [])],
+                "geometry": [geom],
+            }, crs=source_crs if source_crs else output_crs)
+            if source_crs and source_crs != output_crs:
+                gdf = gdf.to_crs(output_crs)
+            return gdf
+
         x, y = self.history.get_final_perimeter()
         if len(x) == 0:
             return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
@@ -595,6 +744,7 @@ class SimulationResults:
         for i, fire in enumerate(self.fires):
             data.append({
                 "fire_id": i,
+                "n_ignitions": len(fire.ignition_positions) if fire.ignition_positions else 1,
                 "x": fire.ignition.x,
                 "y": fire.ignition.y,
                 "cause": fire.ignition.cause,
@@ -694,7 +844,12 @@ def build_parameter_grid(
     fuel_break_zero_ros_mask = None
     
     # Load fuel grid
-    fuel_raster = read_raster_int(config.fuel.path)
+    fuel_raster = reproject_raster(
+        read_raster_int(config.fuel.path),
+        reference=terrain.dem,
+        resampling=Resampling.nearest,
+        nodata=-9999.0,
+    )
     fuel_grid = fuel_raster.data
 
     # Get coordinate arrays from terrain (this is our reference grid)
@@ -705,35 +860,7 @@ def build_parameter_grid(
     logger.info(f"Fuel grid shape: {fuel_grid.shape[0]} x {fuel_grid.shape[1]}")
     logger.debug(f"Terrain CRS: {terrain.dem.crs}, Fuel CRS: {fuel_raster.crs}")
 
-    # Check if fuel grid matches terrain grid
-    if fuel_grid.shape != terrain.shape:
-        logger.warning(
-            f"Fuel grid shape {fuel_grid.shape} differs from terrain {terrain.shape}. "
-            f"Resampling fuel grid to match terrain."
-        )
-        try:
-            import rasterio
-            from rasterio.enums import Resampling
-            from rasterio.warp import reproject
-
-            fuel_resampled = np.zeros((ny, nx), dtype=fuel_grid.dtype)
-            reproject(
-                source=fuel_grid,
-                destination=fuel_resampled,
-                src_transform=fuel_raster.transform,
-                src_crs=fuel_raster.crs,
-                dst_transform=terrain.dem.transform,
-                dst_crs=terrain.dem.crs,
-                resampling=Resampling.nearest,
-            )
-            fuel_grid = fuel_resampled
-            logger.info(f"Reprojected fuel grid to shape: {fuel_grid.shape}")
-        except Exception as e:
-            logger.warning(f"Rasterio reprojection failed: {e}, falling back to simple zoom")
-            from scipy.ndimage import zoom
-            zoom_factors = (ny / fuel_raster.data.shape[0], nx / fuel_raster.data.shape[1])
-            fuel_grid = zoom(fuel_raster.data, zoom_factors, order=0)
-            logger.info(f"Zoomed fuel grid to shape: {fuel_grid.shape}")
+    # Fuel matches the terrain CRS, affine transform and dimensions.
 
     # Load and process fuel breaks if enabled
     # Supports either:
@@ -794,46 +921,15 @@ def build_parameter_grid(
                 # Load break layer (raster or vector) and build mask on terrain grid
                 # -----------------------------------------------------------------
                 if fuel_break_path.suffix.lower() in [".tif", ".tiff"]:
-                    # Raster fuel break
-                    fuel_break_raster = read_raster_int(fuel_break_path)
+                    # Align categorical fuel-break data to the terrain grid.
+                    fuel_break_raster = reproject_raster(
+                        read_raster_int(fuel_break_path),
+                        reference=terrain.dem,
+                        resampling=Resampling.nearest,
+                        nodata=-9999.0,
+                    )
                     fuel_break_grid = fuel_break_raster.data
-
-                    # Resample if needed
-                    if fuel_break_grid.shape != (ny, nx):
-                        logger.info(
-                            f"Resampling fuel break {fb_idx} from {fuel_break_grid.shape} to {(ny, nx)}"
-                        )
-                        try:
-                            import rasterio
-                            from rasterio.enums import Resampling
-                            from rasterio.warp import reproject
-
-                            fuel_break_resampled = np.zeros((ny, nx), dtype=fuel_break_grid.dtype)
-                            reproject(
-                                source=fuel_break_grid,
-                                destination=fuel_break_resampled,
-                                src_transform=fuel_break_raster.transform,
-                                src_crs=fuel_break_raster.crs,
-                                dst_transform=terrain.dem.transform,
-                                dst_crs=terrain.dem.crs,
-                                resampling=Resampling.nearest,
-                            )
-                            fuel_break_grid = fuel_break_resampled
-                            logger.info(f"Reprojected fuel break {fb_idx} to shape: {fuel_break_grid.shape}")
-                        except Exception as e:
-                            logger.warning(f"Rasterio reprojection failed for fuel break {fb_idx}: {e}, using zoom")
-                            from scipy.ndimage import zoom
-
-                            zoom_factors = (
-                                ny / fuel_break_raster.data.shape[0],
-                                nx / fuel_break_raster.data.shape[1],
-                            )
-                            fuel_break_grid = zoom(fuel_break_raster.data, zoom_factors, order=0)
-                            logger.info(f"Zoomed fuel break {fb_idx} to shape: {fuel_break_grid.shape}")
-
-                    # Create mask for fuel break cells (any non-zero value)
-                    # NOTE: keep simple and robust; users can provide a binary break raster
-                    fb_mask = (fuel_break_grid > 0)
+                    fb_mask = fuel_break_grid > 0
 
                 else:
                     # Vector fuel break (shapefile, GeoJSON, etc.)
@@ -1462,6 +1558,196 @@ def simulate_single_fire(
 
 
 # =============================================================================
+# Simultaneous multi-ignition simulation (marker OR level set)
+# =============================================================================
+
+
+def simulate_merged_fire(
+    ignitions: list[IgnitionPoint],
+    param_grid: FireParameterGrid,
+    config: IgnacioConfig,
+) -> FireResult:
+    """Propagate two or more ignitions together in one fire simulation.
+
+    Marker mode evolves separate Richards marker rings and resolves intersections
+    with polygon union inside ``simulate_fire_spread``.
+
+    Level-set mode initializes a *single* signed-distance field from all ignition
+    locations and uses ``simulate_fire_spread_levelset``. Topology changes arise
+    from the field evolution, without marker-style polygon union in the solver.
+
+    Both modes return the same FirePerimeterHistory multi-front representation;
+    each saved time contains one or more exterior rings. Geometry unions below
+    are used ONLY for output statistics, not for advancing the level-set field.
+    """
+    if len(ignitions) < 2:
+        raise ValueError("simulate_merged_fire requires two or more ignitions")
+
+    sim_config = config.simulation
+    method = str(getattr(sim_config, "spread_method", "marker")).strip().lower()
+    if method not in {"marker", "levelset"}:
+        raise ValueError(f"Unsupported multi-ignition spread method: {method!r}")
+
+    positions = [(float(p.x), float(p.y)) for p in ignitions]
+    if not np.isfinite(np.asarray(positions, dtype=float)).all():
+        raise ValueError("Ignition coordinates must be finite")
+    if len(set(positions)) != len(positions):
+        raise ValueError("Simultaneous ignition coordinates must be distinct")
+
+    radius = float(sim_config.initial_radius)
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError("simulation.initial_radius must be positive and finite")
+
+    for i, (x, y) in enumerate(positions, start=1):
+        if not (param_grid.x_min + radius < x < param_grid.x_max - radius
+                and param_grid.y_min + radius < y < param_grid.y_max - radius):
+            raise ValueError(
+                f"Ignition {i}: ({x:.3f}, {y:.3f}) must lie within the "
+                f"projected grid with at least {radius:g} m boundary clearance"
+            )
+
+    if method == "marker":
+        mm = sim_config.marker_method
+        if not mm.enabled:
+            raise ValueError("Multi-front marker propagation requires marker_method.enabled=true")
+        if getattr(mm, "use_rk4_advection", None) is not None:
+            integrator = "rk4" if mm.use_rk4_advection else "euler"
+        else:
+            integrator = mm.advection_integrator or "euler"
+        spacing = getattr(mm, "resample_spacing", None)
+        if spacing is None or float(spacing) <= 0:
+            raise ValueError(
+                "For multiple ignitions using markers, set "
+                "simulation.marker_method.resample_spacing > 0 in metres"
+            )
+        logger.info(
+            "Simultaneous marker experiment: %d ignitions, spacing %.2f m, integrator %s",
+            len(positions), float(spacing), integrator,
+        )
+        history = simulate_fire_spread(
+            param_grid=param_grid,
+            # Keep legacy coordinates for compatibility with an older caller;
+            # all ignition locations are passed explicitly below.
+            x_ignition=positions[0][0],
+            y_ignition=positions[0][1],
+            ignition_points=positions,
+            dt=sim_config.dt,
+            n_vertices=sim_config.n_vertices,
+            initial_radius=radius,
+            store_every=sim_config.store_every,
+            use_markers=True,
+            marker_epsilon=mm.epsilon,
+            min_ros=sim_config.min_ros,
+            is_geographic=False,
+            advection_integrator=integrator,
+            resample_spacing=float(spacing),
+            insert_factor=getattr(mm, "insert_factor", 1.5),
+            delete_factor=getattr(mm, "delete_factor", 0.5),
+            smoothing_weight=getattr(mm, "smooth_weight", 0.0),
+            smoothing_iters=getattr(mm, "smooth_iters", 0),
+            redistribute_every=mm.redistribute_every if mm.redistribute_markers else 0,
+            max_substeps=getattr(mm, "max_substeps", 50),
+            max_move_fraction=getattr(mm, "max_move_fraction", 0.5),
+        )
+        history.marker_method = mm
+        history.marker_epsilon = float(mm.epsilon)
+        # Multi-marker topology is already resolved by the spread solver.
+        # Do NOT run legacy single-ring untangling on these saved fronts.
+
+    else:
+        from ignacio.levelset import simulate_fire_spread_levelset
+
+        ls = sim_config.level_set
+        logger.info(
+            "Simultaneous level-set experiment: %d ignitions, dt=%.4f min, CFL=%.3f",
+            len(positions), float(sim_config.dt), float(ls.cfl_factor),
+        )
+        history = simulate_fire_spread_levelset(
+            param_grid=param_grid,
+            x_ignition=positions[0][0],
+            y_ignition=positions[0][1],
+            ignition_points=positions,
+            dt=sim_config.dt,
+            initial_radius=radius,
+            store_every=sim_config.store_every,
+            min_ros=sim_config.min_ros,
+            is_geographic=False,
+            cfl_factor=ls.cfl_factor,
+            reinit_interval=ls.reinit_interval,
+            reinit_iters=ls.reinit_iters,
+            narrow_band_width=ls.narrow_band_width,
+        )
+        # No Shapely union or marker smoothing is applied to the evolving phi.
+        # The solver extracts all phi=0 exterior fronts into fronts_by_time.
+
+    if getattr(history, "fronts_by_time", None) is None:
+        raise RuntimeError(
+            f"The installed {method} solver returned a single-front history. "
+            "Check that the revised ignacio/spread.py and ignacio/levelset.py "
+            "are installed and provide multi-front support."
+        )
+    if not history.times or len(history.times) != len(history.fronts_by_time):
+        raise RuntimeError("Multi-front history has no snapshots or misaligned timestamps")
+    # Expect a distinct initial contour for each well-separated ignition.
+    # A small grid-resolution allowance avoids misclassifying barely touching
+    # circles that can connect under contour discretization.
+    grid_resolution = max(abs(float(param_grid.dx)), abs(float(param_grid.dy)))
+    if len(history.get_fronts(0)) != len(positions) and all(
+        np.hypot(positions[i][0] - positions[j][0],
+                 positions[i][1] - positions[j][1]) > 2 * radius + 2 * grid_resolution
+        for i in range(len(positions)) for j in range(i + 1, len(positions))
+    ):
+        raise RuntimeError(
+            f"Expected {len(positions)} initially separate fronts but found "
+            f"{len(history.get_fronts(0))}. Check ignition and contour initialization."
+        )
+
+    # Compute statistics from ALL exterior rings at each saved time, avoiding
+    # the invalid assumption that a disconnected fire is one closed ring.
+    stats = []
+    previous_area = 0.0
+    for i, t in enumerate(history.times):
+        geometry = _multi_geometry(history, i)
+        area_ha = float(geometry.area) / 10000.0 if geometry is not None else 0.0
+        perimeter_m = float(geometry.length) if geometry is not None else 0.0
+        fronts = _history_fronts(history, i)
+        ros_values = []
+        t_idx = max(0, min(
+            int(round(float(t) / float(sim_config.dt))), param_grid.nt - 1,
+        ))
+        for x, y in fronts:
+            ros, _, _, _ = param_grid.sample_at(t_idx, x, y)
+            ros = np.asarray(ros)
+            ros_values.extend(ros[np.isfinite(ros) & (ros > 0)].tolist())
+        stats.append({
+            "area_ha": area_ha,
+            "perim_m": perimeter_m,
+            "darea_ha": max(0.0, area_ha - previous_area),
+            "ros_mean": float(np.mean(ros_values)) if ros_values else 0.0,
+            "ros_max": float(np.max(ros_values)) if ros_values else 0.0,
+            "n_fronts": len(fronts),
+        })
+        previous_area = area_ha
+
+    history.history_stats = stats
+    final = stats[-1]
+    logger.info(
+        "%s combined fire: %d ignitions, %d snapshots, area %.4f ha, "
+        "boundary %.2f m, %d merger event(s), %d topology repair(s)",
+        method, len(positions), len(history.times), final["area_ha"],
+        final["perim_m"], len(history.merger_events), len(history.topology_repairs),
+    )
+    return FireResult(
+        ignition=ignitions[0],
+        history=history,
+        final_area_ha=float(final["area_ha"]),
+        final_perimeter_m=float(final["perim_m"]),
+        dur_min=float(history.times[-1]),
+        ignition_positions=positions,
+    )
+
+
+# =============================================================================
 # Main Simulation Entry Point
 # =============================================================================
 
@@ -1567,13 +1853,30 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
     logger.info("=" * 60)
     logger.info("Step 3: Generating ignitions")
     logger.info("=" * 60)
-    fuel_raster = read_raster_int(config.fuel.path)
+    fuel_raster = reproject_raster(
+        read_raster_int(config.fuel.path),
+        reference=terrain.dem,
+        resampling=Resampling.nearest,
+        nodata=-9999.0,
+    )
     
     # Get terrain CRS to ensure ignitions are in the same coordinate system
     terrain_crs = terrain.crs
     if terrain_crs is not None:
         terrain_crs = str(terrain_crs)
+    # Preserve every feature from a multi-point ignition shapefile BEFORE
+    # saving the ignition layer. One run must evolve ALL fronts simultaneously
+    # regardless of whether the selected solver is marker or levelset.
+    simultaneous_points = _file_ignition_positions(config, terrain)
+    if simultaneous_points:
+        method = str(getattr(config.simulation, "spread_method", "marker")).strip().lower()
+        if method not in {"marker", "levelset"}:
+            raise ValueError(f"Unsupported multi-ignition spread method: {method!r}")
+        logger.info("Using %d simultaneous ignition points with %s solver",
+                    len(simultaneous_points), method)
     ignitions = generate_ignitions(config, fuel_raster, rng, terrain_crs=terrain_crs)
+    if simultaneous_points:
+        ignitions = _replace_ignitions_points(ignitions, simultaneous_points)
     
     if config.output.save_ignition_summary:
         ignition_path = output_dir / "ignitions.shp"
@@ -1628,72 +1931,68 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
     
     # Get fuel grid for diagnostics (use the already-resampled param_grid data)
     # Re-load and resample fuel for diagnostics
-    fuel_raster = read_raster_int(config.fuel.path)
+    fuel_raster = reproject_raster(
+        read_raster_int(config.fuel.path),
+        reference=terrain.dem,
+        resampling=Resampling.nearest,
+        nodata=-9999.0,
+    )
     fuel_grid = fuel_raster.data
-    if fuel_grid.shape != terrain.shape:
-        try:
-            import rasterio
-            from rasterio.enums import Resampling
-            from rasterio.warp import reproject
-            
-            fuel_resampled = np.zeros(terrain.shape, dtype=fuel_grid.dtype)
-            reproject(
-                source=fuel_grid,
-                destination=fuel_resampled,
-                src_transform=fuel_raster.transform,
-                src_crs=fuel_raster.crs,
-                dst_transform=terrain.dem.transform,
-                dst_crs=terrain.dem.crs,
-                resampling=Resampling.nearest,
-            )
-            fuel_grid = fuel_resampled
-        except Exception:
-            from scipy.ndimage import zoom
-            zoom_factors = (terrain.shape[0] / fuel_grid.shape[0], terrain.shape[1] / fuel_grid.shape[1])
-            fuel_grid = zoom(fuel_grid, zoom_factors, order=0)
-    
-    for i, ignition in enumerate(ignitions.points):
-        logger.info(f"Fire {i+1}/{n_ignitions}: ({ignition.x:.6f}, {ignition.y:.6f})")
-        
-        # Diagnostic: what's the fuel and ROS at ignition location?
-        try:
-            ros_arr, _, _, _ = param_grid.sample_at(0, np.array([ignition.x]), np.array([ignition.y]))
-            ros_at_ign = ros_arr[0]
-            
-            # Get grid indices for fuel lookup
-            x_frac = (ignition.x - param_grid.x_min) / (param_grid.x_max - param_grid.x_min)
-            x_idx = int(x_frac * (len(param_grid.x_coords) - 1))
-            x_idx = max(0, min(x_idx, fuel_grid.shape[1] - 1))
-            
-            if param_grid.y_flipped:
-                y_frac = (param_grid.y_max - ignition.y) / (param_grid.y_max - param_grid.y_min)
-            else:
-                y_frac = (ignition.y - param_grid.y_min) / (param_grid.y_max - param_grid.y_min)
-            
-            y_idx = int(y_frac * (len(param_grid.y_coords) - 1))
-            y_idx = max(0, min(y_idx, fuel_grid.shape[0] - 1))
-            
-            fuel_at_ign = fuel_grid[y_idx, x_idx]
-            fuel_name = config.fuel.fuel_lookup.get(int(fuel_at_ign), f"Unknown ({fuel_at_ign})")
-            logger.info(f"  Fuel: {fuel_name}, ROS: {ros_at_ign:.2f} m/min")
-            
-            if ros_at_ign < 0.01:
-                logger.warning(f"  ROS at ignition is very low! Fire may not spread.")
-        except Exception as e:
-            logger.warning(f"  Could not get ignition diagnostics: {e}")
-        
-        fire_result = simulate_single_fire(
-            ignition, param_grid, config,
-            is_geographic=is_geographic,
-            center_latitude=center_latitude,
-        )
+
+    if simultaneous_points:
+        if len(ignitions.points) != len(simultaneous_points):
+            raise ValueError("The ignition loader dropped one or more ignition points")
+        fire_result = simulate_merged_fire(list(ignitions.points), param_grid, config)
         results.fires.append(fire_result)
+        logger.info("Combined fire: %d ignitions, area %.4f ha, boundary %.1f m, "
+                    "%d merger events, %d topology repairs",
+                    len(simultaneous_points), fire_result.final_area_ha,
+                    fire_result.final_perimeter_m,
+                    len(fire_result.history.merger_events),
+                    len(fire_result.history.topology_repairs))
+    else:
+        for i, ignition in enumerate(ignitions.points):
+            logger.info(f"Fire {i+1}/{n_ignitions}: ({ignition.x:.6f}, {ignition.y:.6f})")
         
-        if fire_result.final_area_ha > 0:
-            logger.info(
-                f"  - Area: {fire_result.final_area_ha:.2f} ha, "
-                f"Perimeter: {fire_result.final_perimeter_m:.0f} m"
+            # Diagnostic: what's the fuel and ROS at ignition location?
+            try:
+                ros_arr, _, _, _ = param_grid.sample_at(0, np.array([ignition.x]), np.array([ignition.y]))
+                ros_at_ign = ros_arr[0]
+            
+                # Get grid indices for fuel lookup
+                x_frac = (ignition.x - param_grid.x_min) / (param_grid.x_max - param_grid.x_min)
+                x_idx = int(x_frac * (len(param_grid.x_coords) - 1))
+                x_idx = max(0, min(x_idx, fuel_grid.shape[1] - 1))
+            
+                if param_grid.y_flipped:
+                    y_frac = (param_grid.y_max - ignition.y) / (param_grid.y_max - param_grid.y_min)
+                else:
+                    y_frac = (ignition.y - param_grid.y_min) / (param_grid.y_max - param_grid.y_min)
+            
+                y_idx = int(y_frac * (len(param_grid.y_coords) - 1))
+                y_idx = max(0, min(y_idx, fuel_grid.shape[0] - 1))
+            
+                fuel_at_ign = fuel_grid[y_idx, x_idx]
+                fuel_name = config.fuel.fuel_lookup.get(int(fuel_at_ign), f"Unknown ({fuel_at_ign})")
+                logger.info(f"  Fuel: {fuel_name}, ROS: {ros_at_ign:.2f} m/min")
+            
+                if ros_at_ign < 0.01:
+                    logger.warning(f"  ROS at ignition is very low! Fire may not spread.")
+            except Exception as e:
+                logger.warning(f"  Could not get ignition diagnostics: {e}")
+        
+            fire_result = simulate_single_fire(
+                ignition, param_grid, config,
+                is_geographic=is_geographic,
+                center_latitude=center_latitude,
             )
+            results.fires.append(fire_result)
+        
+            if fire_result.final_area_ha > 0:
+                logger.info(
+                    f"  - Area: {fire_result.final_area_ha:.2f} ha, "
+                    f"Perimeter: {fire_result.final_perimeter_m:.0f} m"
+                )
     
     # Step 6: Save outputs
     logger.info("=" * 60)
@@ -1707,7 +2006,7 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
     logger.info("=" * 60)
     logger.info("Simulation Complete")
     logger.info("=" * 60)
-    logger.info(f"Total fires simulated: {results.n_fires}")
+    logger.info(f"Total simulations: {results.n_fires}; ignition points: {ignitions.n_points}")
     logger.info(f"Total area burned: {results.total_area_ha:.2f} ha")
     logger.info(f"Output directory: {output_dir}")
     
@@ -1736,6 +2035,47 @@ def perimeter_history_to_gdf(
     - `fire.history.times` is assumed to be minutes since ignition/start.
     - Use GeoPackage (GPKG) if you want robust datetime storage.
     """
+    # In a multi-front run each time can have 2+ exterior rings. Emit one row
+    # for each ring. All metadata remains in the projected CRS until GeoPandas
+    # performs the requested reprojection for storage.
+    if getattr(fire.history, "fronts_by_time", None) is not None:
+        start_ts = pd.Timestamp(start_datetime) if start_datetime else None
+        rows = []
+        stats = getattr(fire.history, "history_stats", [])
+        for step, t_min in enumerate(fire.history.times):
+            fronts = _history_fronts(fire.history, step)
+            st = stats[step] if step < len(stats) else {}
+            for front_id, (x, y) in enumerate(fronts):
+                poly = _front_polygon(x, y)
+                when = (start_ts + pd.Timedelta(minutes=float(t_min))) if start_ts is not None else None
+                rows.append({
+                    "fire_index": int(fire_index),
+                    "front_id": int(front_id),
+                    "n_fronts": int(len(fronts)),
+                    "n_ignitions": int(len(fire.ignition_positions or [])),
+                    "step": int(step),
+                    "t_min": float(t_min),
+                    "cause": fire.ignition.cause,
+                    "season": fire.ignition.season,
+                    "iteration": int(fire.ignition.iteration),
+                    "datetime": when.to_pydatetime() if when is not None else None,
+                    "area_ha": float(poly.area / 10000.0),
+                    "perim_m": float(poly.length),
+                    "total_area_ha": float(st.get("area_ha", np.nan)),
+                    "total_perim_m": float(st.get("perim_m", np.nan)),
+                    "darea_ha": float(st.get("darea_ha", np.nan)),
+                    "ros_mean": float(st.get("ros_mean", np.nan)),
+                    "ros_max": float(st.get("ros_max", np.nan)),
+                    "geometry": poly,
+                })
+        if not rows:
+            return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
+        gdf = gpd.GeoDataFrame(rows, geometry="geometry",
+                               crs=source_crs if source_crs else output_crs)
+        if source_crs and source_crs != output_crs:
+            gdf = gdf.to_crs(output_crs)
+        return gdf
+
     perims = getattr(fire.history, "perimeters", None) or []
     times = getattr(fire.history, "times", None) or []
 
@@ -1936,6 +2276,24 @@ def _save_results(
     else:
         logger.info("No perimeter history to save (no stored perimeters/times found)")
     
+    # Additional diagnostic tables for simultaneous ignition experiments.
+    for i, fire in enumerate(results.fires):
+        history = fire.history
+        if getattr(history, "fronts_by_time", None) is None:
+            continue
+        stats_rows = []
+        for step, t in enumerate(history.times):
+            st = dict(history.history_stats[step]) if step < len(history.history_stats) else {}
+            stats_rows.append({"step": step, "t_min": float(t), **st})
+        pd.DataFrame(stats_rows).to_csv(
+            output_dir / f"fire_{i:04d}_history_totals.csv", index=False)
+        if history.merger_events:
+            pd.DataFrame(history.merger_events).to_csv(
+                output_dir / f"fire_{i:04d}_merger_events.csv", index=False)
+        if history.topology_repairs:
+            pd.DataFrame(history.topology_repairs).to_csv(
+                output_dir / f"fire_{i:04d}_topology_repairs.csv", index=False)
+
     # Save summary CSV
     summary = results.get_summary()
     summary_path = output_dir / "simulation_summary.csv"
