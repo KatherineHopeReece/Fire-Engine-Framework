@@ -15,7 +15,7 @@ import numpy as np
 from scipy.ndimage import sobel
 
 from ignacio.config import IgnacioConfig
-from ignacio.io import RasterData, read_raster, write_raster
+from ignacio.io import RasterData, read_raster, write_raster,reproject_raster
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ def compute_slope_aspect(
     # Aspect: direction of steepest descent
     # Using atan2 for proper quadrant handling
     # Convention: 0 = north, 90 = east, 180 = south, 270 = west
-    aspect_rad = np.arctan2(dzdx, -dzdy)
+    aspect_rad = np.arctan2(-dzdx, dzdy)
     aspect_deg = np.degrees(aspect_rad)
     aspect_deg = np.mod(aspect_deg, 360.0)
     
@@ -185,7 +185,7 @@ def compute_slope_aspect_simple(
     slope_deg = np.degrees(np.arctan(grad_mag))
     
     # Aspect
-    aspect_deg = np.degrees(np.arctan2(dzdx, -dzdy))
+    aspect_deg = np.degrees(np.arctan2(-dzdx, dzdy))
     aspect_deg = np.mod(aspect_deg, 360.0)
     
     flat_mask = grad_mag < 1e-6
@@ -222,6 +222,35 @@ def build_terrain_grids(config: IgnacioConfig) -> TerrainGrids:
     """
     logger.info(f"Loading DEM from {config.terrain.dem_path}")
     dem = read_raster(config.terrain.dem_path)
+    
+        # Project before computing terrain derivatives or coordinate arrays.
+    from pyproj import CRS as PyprojCRS
+
+    working_crs = PyprojCRS.from_user_input(
+        config.crs.working_crs
+    )
+
+    if (
+        not working_crs.is_projected
+        or len(working_crs.axis_info) < 2
+        or any(
+            not np.isclose(axis.unit_conversion_factor, 1.0)
+            for axis in working_crs.axis_info[:2]
+        )
+    ):
+        raise ValueError(
+            "working_crs must be projected with metre units, "
+            "for example EPSG:32611."
+        )
+
+    dem = reproject_raster(
+        dem,
+        target_crs=working_crs.to_wkt(),
+    )
+
+    logger.info(
+        f"Simulation DEM uses metric working CRS: {dem.crs}"
+    )
     
     # Log DEM statistics
     valid_dem = dem.data[np.isfinite(dem.data)]
@@ -293,16 +322,44 @@ def build_terrain_grids(config: IgnacioConfig) -> TerrainGrids:
     aspect_path = config.terrain.aspect_path
     
     if slope_path and Path(slope_path).exists():
-        logger.info(f"Loading pre-computed slope from {slope_path}")
+        logger.info(
+            f"Loading pre-computed slope from {slope_path}"
+        )
         slope_raster = read_raster(slope_path)
-        slope_deg = slope_raster.data
+
+        if (
+            slope_raster.crs == dem.crs
+            and slope_raster.shape == dem.shape
+            and slope_raster.transform == dem.transform
+        ):
+            slope_deg = slope_raster.data
+        else:
+            logger.warning(
+                "Precomputed slope grid differs from metric DEM; "
+                "recomputing."
+            )
+            slope_deg = None
     else:
         slope_deg = None
-    
+
     if aspect_path and Path(aspect_path).exists():
-        logger.info(f"Loading pre-computed aspect from {aspect_path}")
+        logger.info(
+            f"Loading pre-computed aspect from {aspect_path}"
+        )
         aspect_raster = read_raster(aspect_path)
-        aspect_deg = aspect_raster.data
+
+        if (
+            aspect_raster.crs == dem.crs
+            and aspect_raster.shape == dem.shape
+            and aspect_raster.transform == dem.transform
+        ):
+            aspect_deg = aspect_raster.data
+        else:
+            logger.warning(
+                "Precomputed aspect grid differs from metric DEM; "
+                "recomputing."
+            )
+            aspect_deg = None
     else:
         aspect_deg = None
     

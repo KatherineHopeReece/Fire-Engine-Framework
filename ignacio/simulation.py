@@ -20,8 +20,9 @@ from typing import Any
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon, MultiPolygon, LineString
 from shapely.ops import unary_union
+import json
 from rasterio.enums import Resampling
 
 # Optional Shapely validity helpers (Shapely 2.0+)
@@ -60,6 +61,233 @@ from ignacio.weather import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Solver selection and topology-preserving history utilities
+# =============================================================================
+
+
+def _get_spread_method(sim_config) -> str:
+    """Return a canonical solver name, compatible with both config versions.
+
+    The modern selector is ``method``. Old configuration files use
+    ``spread_method``. Raise on inconsistent choices rather than accidentally
+    executing marker physics for a level-set experiment.
+    """
+    aliases = {
+        "marker": "lagrangian",
+        "markers": "lagrangian",
+        "front": "lagrangian",
+        "lagrangian": "lagrangian",
+        "levelset": "level_set",
+        "level_set": "level_set",
+    }
+    modern = getattr(sim_config, "method", None)
+    legacy = getattr(sim_config, "spread_method", None)
+    selected = modern if modern is not None else legacy
+    if selected is None:
+        raise ValueError("No simulation method configured (method/spread_method)")
+    canonical = aliases.get(str(selected).strip().lower())
+    if canonical is None:
+        raise ValueError(f"Unsupported fire spread method: {selected!r}")
+    if modern is not None and legacy is not None:
+        other = aliases.get(str(legacy).strip().lower())
+        if other != canonical:
+            raise ValueError("simulation.method and simulation.spread_method conflict")
+    return canonical
+
+
+def _max_steps(config: IgnacioConfig) -> int:
+    """Ceiling avoids inadvertently dropping a final partial timestep."""
+    sim = config.simulation
+    return max(1, int(np.ceil(float(sim.max_duration) / float(sim.dt))))
+
+
+def _marker_kwargs(config: IgnacioConfig, *, geographic: bool = False,
+                   latitude: float | None = None) -> dict[str, Any]:
+    """Forward all H5 topology and numerical controls to ignacio.spread."""
+    marker = config.simulation.marker_method
+    spacing = marker.resample_spacing
+    if geographic and spacing is not None:
+        if latitude is None:
+            raise ValueError("Latitude required for geographic marker spacing")
+        import math
+        spacing = float(spacing) / (
+            111320.0 * math.sqrt(max(math.cos(math.radians(latitude)), 1e-8))
+        )
+    return {
+        "use_markers": bool(marker.enabled),
+        "marker_epsilon": float(marker.epsilon),
+        "advection_integrator": str(marker.advection_integrator),
+        "resample_spacing": spacing,
+        "insert_factor": float(marker.insert_factor),
+        "delete_factor": float(marker.delete_factor),
+        "smoothing_weight": float(marker.smooth_weight),
+        "smoothing_iters": int(marker.smooth_iters),
+        "redistribute_every": (
+            int(marker.redistribute_every) if marker.redistribute_markers else 0
+        ),
+        "max_substeps": int(marker.max_substeps),
+        "max_move_fraction": float(marker.max_move_fraction),
+        "topology_mode": str(getattr(marker, "topology_mode", "legacy")),
+        "barrier_mode": str(getattr(marker, "barrier_mode", "off")),
+        "barrier_debug_dir": str(getattr(marker, "barrier_debug_dir", "marker_barrier_debug")),
+        "export_burned_geometry": bool(
+            getattr(marker, "export_burned_geometry", False)
+            or getattr(marker, "topology_mode", "legacy") == "outer_hull"
+        ),
+        "sim_config": config.simulation,
+    }
+
+
+def _levelset_kwargs(config: IgnacioConfig) -> dict[str, Any]:
+    """Translate Pydantic option names to actual levelset.py arguments."""
+    ls = config.simulation.level_set
+    reinit = getattr(ls, "reinit_every", getattr(ls, "reinit_interval", 0))
+    narrow_band_enabled = bool(getattr(ls, "narrow_band", True))
+    return {
+        "cfl_factor": float(ls.cfl_factor),
+        "reinit_interval": int(reinit),
+        "reinit_iters": int(ls.reinit_iters),
+        "narrow_band_width": (
+            int(ls.narrow_band_width) if narrow_band_enabled else None
+        ),
+    }
+
+
+def _polygon_parts(geom: Any) -> list[Polygon]:
+    """Retrieve every polygon component, including GeometryCollections."""
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon) or hasattr(geom, "geoms"):
+        parts = []
+        for piece in geom.geoms:
+            parts.extend(_polygon_parts(piece))
+        return parts
+    return []
+
+
+def _history_holes(history: Any, index: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Read active inner fire fronts without assuming a specific solver."""
+    getter = getattr(history, "get_holes", None)
+    if callable(getter):
+        return list(getter(index))
+    holes = getattr(history, "holes_by_time", None)
+    return list(holes[index]) if holes is not None else []
+
+
+def _history_geometry(history: Any, index: int):
+    """Read the exact Polygon/MultiPolygon first; never discard holes.
+
+    If the solver supplies only exterior rings, we can reconstruct disconnected
+    components, but cannot invent unknown level-set interior holes. Explicit
+    holes_by_time, when available, are subtracted from those exterior polygons.
+    """
+    times = getattr(history, "times", None) or []
+    if not times:
+        return None
+    exact = getattr(history, "burned_geometries", None)
+    if exact is not None:
+        if len(exact) != len(times):
+            raise ValueError("Burned geometries are not aligned with times")
+        geom = exact[index]
+    else:
+        getter = getattr(history, "get_burned_geometry", None)
+        if callable(getter):
+            geom = getter(index)
+        else:
+            geom = None
+        if geom is None:
+            geom = _multi_geometry(history, index)
+        holes = _history_holes(history, index)
+        if geom is not None and holes:
+            hole_poly = unary_union([_front_polygon(x, y) for x, y in holes])
+            geom = geom.difference(hole_poly)
+    parts = _polygon_parts(geom)
+    if not parts:
+        return None
+    result = parts[0] if len(parts) == 1 else unary_union(parts)
+    if not result.is_valid:
+        raise ValueError("Invalid burned geometry; repair in solver, not GIS export")
+    return result
+
+
+def _geometry_metrics(geom: Any, is_geographic: bool = False) -> tuple[float, float]:
+    """Return burned area in hectares and full boundary length in metres."""
+    if geom is None or geom.is_empty:
+        return 0.0, 0.0
+    if not is_geographic:
+        return float(geom.area) / 10000.0, float(geom.length)
+    from pyproj import Geod
+    geod = Geod(ellps="WGS84")
+    area_m2 = length_m = 0.0
+    for part in _polygon_parts(geom):
+        rings = [(part.exterior, 1)] + [(hole, -1) for hole in part.interiors]
+        for ring, sign in rings:
+            coords = np.asarray(ring.coords)
+            area, length = geod.polygon_area_perimeter(coords[:, 0], coords[:, 1])
+            area_m2 += sign * abs(area)
+            length_m += length
+    return max(0.0, area_m2) / 10000.0, length_m
+
+
+def _history_statistics(history: Any, param_grid: FireParameterGrid,
+                        config: IgnacioConfig, is_geographic: bool = False):
+    """Metrics from full polygons, retaining signed area changes for QA."""
+    times = getattr(history, "times", None) or []
+    records = []
+    previous_area = None
+    for i, time_min in enumerate(times):
+        geom = _history_geometry(history, i)
+        area_ha, perim_m = _geometry_metrics(geom, is_geographic=is_geographic)
+        fronts = _history_fronts(history, i)
+        holes = _history_holes(history, i)
+        ros_samples = []
+        t_idx = max(0, min(int(round(float(time_min) / config.simulation.dt)), param_grid.nt - 1))
+        for x, y in fronts:
+            if len(x) == 0:
+                continue
+            ros, _, _, _ = param_grid.sample_at(t_idx, np.asarray(x), np.asarray(y))
+            valid = np.asarray(ros, dtype=float)
+            valid = valid[np.isfinite(valid) & (valid > 0)]
+            if valid.size:
+                ros_samples.append(valid)
+        all_ros = np.concatenate(ros_samples) if ros_samples else np.array([], dtype=float)
+        parts = _polygon_parts(geom)
+        signed_delta = 0.0 if previous_area is None else area_ha - previous_area
+        records.append({
+            "area_ha": area_ha,
+            "perim_m": perim_m,
+            "darea_ha": signed_delta,
+            "ros_mean": float(np.mean(all_ros)) if all_ros.size else 0.0,
+            "ros_max": float(np.max(all_ros)) if all_ros.size else 0.0,
+            "n_fronts": len(parts),
+            "n_holes": sum(len(p.interiors) for p in parts),
+            "n_active_fronts": len(fronts),
+            "n_active_holes": len(holes),
+            "geometry_valid": bool(geom is not None and geom.is_valid),
+        })
+        if previous_area is not None and signed_delta < -1e-8:
+            logger.warning("Burned area fell by %.6f ha at t=%.4f min",
+                           -signed_delta, float(time_min))
+        previous_area = area_ha
+    history.history_stats = records
+    return records
+
+
+def _check_metric_grid(terrain: TerrainGrids) -> None:
+    """Multi-ignition front propagation is defined here in projected metres."""
+    from pyproj import CRS
+    if terrain.crs is None:
+        raise ValueError("Multi-ignition runs require a defined CRS")
+    crs = CRS.from_user_input(terrain.crs)
+    if not crs.is_projected or any(
+        abs(a.unit_conversion_factor - 1.0) > 1e-6 for a in crs.axis_info[:2]
+    ):
+        raise ValueError("Multi-ignition runs require projected metre CRS")
 
 
 # =============================================================================
@@ -508,11 +736,9 @@ def _front_polygon(x: np.ndarray, y: np.ndarray) -> Polygon:
 
 
 def _multi_geometry(history: FirePerimeterHistory, index: int):
-    """Dissolved burned geometry for a snapshot. Preserve disconnected fronts."""
+    """Exterior-only fallback for legacy histories without exact polygons."""
     polygons = [_front_polygon(x, y) for x, y in _history_fronts(history, index)]
-    if not polygons:
-        return None
-    return unary_union(polygons)
+    return unary_union(polygons) if polygons else None
 
 
 def _file_ignition_positions(config: IgnacioConfig, terrain: TerrainGrids):
@@ -601,105 +827,25 @@ class FireResult:
     ignition_positions: list[tuple[float, float]] | None = None
     
     def get_final_polygon(self, output_crs: str, source_crs: str | None = None) -> gpd.GeoDataFrame:
-        """Get final fire perimeter as GeoDataFrame.
-        
-        Parameters
-        ----------
-        output_crs : str
-            Desired output CRS.
-        source_crs : str, optional
-            CRS of the source coordinates. If different from output_crs,
-            the polygon will be reprojected.
-        """
-        # Multiple ignition histories can have several disconnected exterior
-        # rings. Never call the legacy get_final_perimeter() in that case.
-        if getattr(self.history, "fronts_by_time", None) is not None:
-            if not self.history.times:
-                return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
-            geom = _multi_geometry(self.history, -1)
-            if geom is None or geom.is_empty:
-                return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
-            gdf = gpd.GeoDataFrame({
-                "area_ha": [self.final_area_ha],
-                "perim_m": [self.final_perimeter_m],
-                "dur_min": [self.dur_min],
-                "cause": [self.ignition.cause],
-                "season": [self.ignition.season],
-                "iteration": [self.ignition.iteration],
-                "n_ignitions": [len(self.ignition_positions or [])],
-                "geometry": [geom],
-            }, crs=source_crs if source_crs else output_crs)
-            if source_crs and source_crs != output_crs:
-                gdf = gdf.to_crs(output_crs)
-            return gdf
-
-        x, y = self.history.get_final_perimeter()
-        if len(x) == 0:
-            return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
-
-        # Build polygon from perimeter coordinates
-        ring = list(zip(x.tolist(), y.tolist()))
-        ring = _ensure_ring_closed(ring, eps=0.0)
-
-        # Level set contours are topologically clean — skip cleaning/smoothing
-        _is_level_set = (self.history is not None
-                         and not hasattr(self.history, "marker_method")
-                         and not hasattr(self.history, "marker_epsilon"))
-
-        if _is_level_set:
-            polygon = Polygon(ring)
-            if not polygon.is_valid:
-                polygon = polygon.buffer(0)
-                if isinstance(polygon, MultiPolygon):
-                    polygon = max(polygon.geoms, key=lambda g: g.area)
-        else:
-            # Use marker epsilon as a reasonable default tolerance if available
-            eps = 0.0
-            try:
-                if self.history is not None and hasattr(self.history, "marker_epsilon"):
-                    eps = float(getattr(self.history, "marker_epsilon") or 0.0)
-            except Exception:
-                eps = 0.0
-
-            # Simplify tolerance: small fraction of epsilon (or disabled)
-            simplify_tol = (0.5 * eps) if eps and eps > 0 else None
-
-            poly = _clean_polygon_from_ring(
-                ring,
-                eps=eps,
-                simplify_tol=simplify_tol,
-                resample_spacing=(
-                    float(getattr(getattr(self.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
-                    if hasattr(self.history, "marker_method")
-                    else (eps if eps and eps > 0 else None)
-                ),
-                chaikin_iters=(
-                    int(getattr(getattr(self.history, "marker_method", None), "chaikin_iters", 0) or 0)
-                    if hasattr(self.history, "marker_method")
-                    else 1
-                ),
-            )
-            polygon = poly if poly is not None else Polygon(ring)
-
-        # Create GeoDataFrame with source CRS
-        gdf = gpd.GeoDataFrame(
-            {
-                "area_ha": [self.final_area_ha],
-                "perim_m": [self.final_perimeter_m],
-                "dur_min": [self.dur_min],
-                "cause": [self.ignition.cause],
-                "season": [self.ignition.season],
-                "iteration": [self.ignition.iteration],
-                "geometry": [polygon],
-            },
-            crs=source_crs if source_crs else output_crs,
-        )
-
-        # Reproject if needed
+        """Final burned geometry, including all disconnected regions and holes."""
+        geom = _history_geometry(self.history, -1)
+        if geom is None:
+            return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs=output_crs)
+        gdf = gpd.GeoDataFrame({
+            "area_ha": [self.final_area_ha],
+            "perim_m": [self.final_perimeter_m],
+            "dur_min": [self.dur_min],
+            "cause": [self.ignition.cause],
+            "season": [self.ignition.season],
+            "iteration": [getattr(self.ignition, "iteration", 0)],
+            "n_ignitions": [len(self.ignition_positions or []) or 1],
+            "geometry": [geom],
+        }, geometry="geometry", crs=source_crs or output_crs)
         if source_crs and source_crs != output_crs:
             gdf = gdf.to_crs(output_crs)
-
         return gdf
+
+
 
 
 @dataclass
@@ -735,8 +881,11 @@ class SimulationResults:
         
         output_crs = self.config.crs.output_crs if self.config else "EPSG:4326"
         gdfs = [f.get_final_polygon(output_crs, source_crs=source_crs) for f in self.fires]
-        
-        return gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=output_crs)
+        gdfs = [gdf for gdf in gdfs if not gdf.empty]
+        if not gdfs:
+            return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs=output_crs)
+        return gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True),
+                                geometry="geometry", crs=output_crs)
     
     def get_summary(self) -> pd.DataFrame:
         """Get summary statistics for all fires."""
@@ -755,6 +904,72 @@ class SimulationResults:
                 "dur_min": fire.dur_min,
             })
         return pd.DataFrame(data)
+
+
+# =============================================================================
+# Fuel-break rasterization aligned to the IGNACIO parameter grid
+# =============================================================================
+
+
+def _rasterize_fuel_break_geometries(
+    fuel_break_gdf: gpd.GeoDataFrame,
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+    ny: int,
+    nx: int,
+    *,
+    all_touched: bool = False,
+) -> np.ndarray:
+    """Rasterize a vector fuel-break layer to the terrain's cell-centre grid.
+
+    Uses rasterio.features.rasterize directly rather than IGNACIO's legacy
+    rasterize_geometries wrapper (whose accepted keyword arguments differ).
+    The signed dy supports the north-up, descending-y DEM used by IGNACIO.
+    Returns a uint8 grid containing 1 for covered cells and 0 otherwise.
+
+    This function makes *no* changes to spread or fuel-break treatments.
+    """
+    from affine import Affine
+    from rasterio.features import rasterize
+
+    x = np.asarray(x_coords, dtype=float)
+    y = np.asarray(y_coords, dtype=float)
+    if nx < 2 or ny < 2 or x.shape != (nx,) or y.shape != (ny,):
+        raise ValueError("Fuel-break rasterization requires 1-D x/y cell-centre coordinates")
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("Terrain grid coordinates contain non-finite values")
+
+    dx = float(x[1] - x[0])
+    dy = float(y[1] - y[0])
+    if (dx == 0.0 or dy == 0.0
+            or not np.allclose(np.diff(x), dx, rtol=1e-7, atol=1e-9)
+            or not np.allclose(np.diff(y), dy, rtol=1e-7, atol=1e-9)):
+        raise ValueError("Fuel-break rasterization requires a uniformly spaced grid")
+
+    if fuel_break_gdf is None or fuel_break_gdf.empty:
+        raise ValueError("Enabled fuel-break vector layer is empty")
+    shapes = []
+    for i, geom in enumerate(fuel_break_gdf.geometry):
+        if geom is None or geom.is_empty:
+            raise ValueError(f"Fuel-break feature {i} has missing/empty geometry")
+        if not geom.is_valid:
+            raise ValueError(f"Fuel-break feature {i} has invalid geometry")
+        shapes.append((geom, 1))
+
+    # x/y are cell centres; rasterio's transform locates the upper-left
+    # *corner* of pixel (0, 0). Preserve the sign of dy for north-up rasters.
+    transform = Affine.translation(
+        float(x[0] - dx / 2.0), float(y[0] - dy / 2.0)
+    ) * Affine.scale(dx, dy)
+
+    return rasterize(
+        shapes,
+        out_shape=(int(ny), int(nx)),
+        transform=transform,
+        fill=0,
+        dtype="uint8",
+        all_touched=bool(all_touched),
+    )
 
 
 # =============================================================================
@@ -805,7 +1020,7 @@ def build_parameter_grid(
         rng = np.random.default_rng(config.project.random_seed)
 
     if n_timesteps is None:
-        n_timesteps = int(sim_config.max_duration / sim_config.dt)
+        n_timesteps = _max_steps(config)
     
     # Determine if using time-varying weather
     use_time_varying = (
@@ -966,17 +1181,23 @@ def build_parameter_grid(
                         else:
                             fuel_break_gdf.geometry = fuel_break_gdf.geometry.buffer(fb_cfg.buffer_m)
 
-                    # Rasterize to match terrain grid
+                    # Rasterize to the *same* 2-D cell centres used by the
+                    # ROS/BROS/FROS grids, using rasterio's supported API.
                     logger.info(f"Rasterizing {len(fuel_break_gdf)} fuel break features (break {fb_idx})")
-                    fuel_break_grid = rasterize_geometries(
+                    fuel_break_grid = _rasterize_fuel_break_geometries(
                         fuel_break_gdf,
-                        reference=terrain.dem,
-                        value=1,
-                        fill=0,
-                        dtype="uint8",
+                        x_coords=x_coords,
+                        y_coords=y_coords,
+                        ny=ny,
+                        nx=nx,
                         all_touched=fb_cfg.all_touched,
                     )
                     fb_mask = (fuel_break_grid == 1)
+                    logger.info(
+                        "Fuel break %d rasterization covered %d of %d cells (%.2f%%)",
+                        fb_idx, int(fb_mask.sum()), ny * nx,
+                        100.0 * float(fb_mask.sum()) / (ny * nx),
+                    )
 
                 # -------------------------------------------------------------
                 # Apply preserve_non_fuel filter (per break)
@@ -1019,21 +1240,31 @@ def build_parameter_grid(
                     )
 
             except Exception as e:
-                logger.error(f"Failed to load/apply fuel break {fb_idx}: {e}")
-                logger.warning("Continuing simulation without this fuel break")
-                import traceback
-
-                logger.debug(traceback.format_exc())
+                # An enabled zero-ROS break is part of the physical experiment.
+                # Never run the fire solver with that constraint silently absent.
+                logger.exception(
+                    "Failed to load/apply enabled fuel break %d from %s",
+                    fb_idx, fb_cfg.path,
+                )
+                raise RuntimeError(
+                    f"Required fuel break {fb_idx} ({fb_cfg.path}) could not be applied"
+                ) from e
 
         # If no cells ended up in the zero_ros mask, disable it
         if fuel_break_zero_ros_mask is not None and not np.any(fuel_break_zero_ros_mask):
             fuel_break_zero_ros_mask = None
     
-    # Initialize arrays
-    ros_arr = np.zeros((n_timesteps, ny, nx), dtype=np.float32)
-    bros_arr = np.zeros_like(ros_arr)
-    fros_arr = np.zeros_like(ros_arr)
-    raz_arr = np.zeros_like(ros_arr)
+    # Constant weather only needs four 2-D slices.  A read-only broadcast
+    # along time retains FireParameterGrid's (nt, ny, nx) API without holding
+    # four separate 3,500 x 500 x 500 arrays (~14 GB) in physical RAM.
+    # Dynamic weather still allocates independent arrays for every timestep.
+    if use_time_varying:
+        ros_arr = np.zeros((n_timesteps, ny, nx), dtype=np.float32)
+        bros_arr = np.zeros_like(ros_arr)
+        fros_arr = np.zeros_like(ros_arr)
+        raz_arr = np.zeros_like(ros_arr)
+    else:
+        ros_arr = bros_arr = fros_arr = raz_arr = None
     
     logger.info(f"Building parameter grid: {n_timesteps} timesteps, {ny}x{nx} cells")
     
@@ -1082,7 +1313,7 @@ def build_parameter_grid(
                 base_ros[mask] = ros
 
             # Apply terrain-aware wind deflection (spatially varying WD)
-            terrain_deflection = fbp_config.terrain_wind_deflection
+            terrain_deflection = float(getattr(fbp_config, "terrain_wind_deflection", 0.0))
             if terrain_deflection > 0:
                 from ignacio.terrain import compute_terrain_wind_direction
                 wind_dir_grid_t = compute_terrain_wind_direction(
@@ -1240,17 +1471,29 @@ def build_parameter_grid(
         raz_deg = (wind_dir + 180.0) % 360.0
         raz_rad = np.radians(raz_deg)
 
-        # Fill time dimension (constant weather)
-        for t in range(n_timesteps):
-            ros_arr[t] = ros_corrected
-            bros_arr[t] = bros_base
-            fros_arr[t] = fros_base
-            raz_arr[t] = raz_rad
-    
-    # Apply global ROS scale factor
-    _ros_scale = getattr(config.fbp, "ros_scale", 1.0)
-    if _ros_scale != 1.0:
-        logger.info(f"Applying ros_scale={_ros_scale:.4f} to all ROS components")
+        # Apply scaling before broadcasting: the views are deliberately
+        # read-only, because downstream solvers must not mutate input grids.
+        _ros_scale = float(getattr(config.fbp, "ros_scale", 1.0))
+        if _ros_scale != 1.0:
+            logger.info("Applying ros_scale=%.4f to static ROS components", _ros_scale)
+            ros_corrected = ros_corrected * _ros_scale
+            bros_base = bros_base * _ros_scale
+            fros_base = fros_base * _ros_scale
+
+        def _time_broadcast(slice_2d):
+            values = np.asarray(slice_2d, dtype=np.float32)
+            return np.broadcast_to(values[None, :, :], (n_timesteps, ny, nx))
+
+        ros_arr = _time_broadcast(ros_corrected)
+        bros_arr = _time_broadcast(bros_base)
+        fros_arr = _time_broadcast(fros_base)
+        raz_arr = _time_broadcast(np.full((ny, nx), raz_rad, dtype=np.float32))
+        logger.info("Static-weather parameter fields use shared 2-D broadcast slices")
+
+    # Time-varying fields are unique for each time, so scale in place.
+    _ros_scale = float(getattr(config.fbp, "ros_scale", 1.0))
+    if use_time_varying and _ros_scale != 1.0:
+        logger.info("Applying ros_scale=%.4f to time-varying ROS components", _ros_scale)
         ros_arr *= _ros_scale
         bros_arr *= _ros_scale
         fros_arr *= _ros_scale
@@ -1267,6 +1510,10 @@ def build_parameter_grid(
     else:
         logger.warning("No cells have ROS > 0! Check fuel type mapping.")
     
+    nonfuel_mask = np.isin(fuel_grid, config.fuel.non_fuel_codes)
+    if fuel_break_zero_ros_mask is not None:
+        nonfuel_mask |= fuel_break_zero_ros_mask
+
     return FireParameterGrid(
         x_coords=x_coords,
         y_coords=y_coords,
@@ -1274,6 +1521,7 @@ def build_parameter_grid(
         bros=bros_arr,
         fros=fros_arr,
         raz=raz_arr,
+        nonfuel_mask=nonfuel_mask,
     )
 
 
@@ -1289,271 +1537,67 @@ def simulate_single_fire(
     is_geographic: bool = False,
     center_latitude: float | None = None,
 ) -> FireResult:
-    """
-    Simulate a single fire from ignition point.
-    
-    Parameters
-    ----------
-    ignition : IgnitionPoint
-        Ignition location and metadata.
-    param_grid : FireParameterGrid
-        Fire behaviour parameter grid.
-    config : IgnacioConfig
-        Configuration object.
-    is_geographic : bool
-        If True, coordinates are in degrees (lat/lon).
-    center_latitude : float, optional
-        Center latitude for geographic conversion.
-        
-    Returns
-    -------
-    FireResult
-        Simulation results for this fire.
-    """
-    sim_config = config.simulation
-    
-    # Check if ignition is within grid bounds
-    if not (param_grid.x_min <= ignition.x <= param_grid.x_max and
-            param_grid.y_min <= ignition.y <= param_grid.y_max):
-        logger.warning(
-            f"Ignition ({ignition.x}, {ignition.y}) outside grid bounds, skipping"
-        )
-        return FireResult(
-            ignition=ignition,
-            history=FirePerimeterHistory(perimeters=[], times=[]),
-        )
-    
-    # Markersmethodchange: log chosen advection integrator from YAML.
-    try:
-        logger.info(
-            f"Requested advection integrator: {getattr(sim_config.marker_method, 'advection_integrator', None)}"
-        )
-    except Exception:
-        pass
-    # Run spread simulation
-    if getattr(sim_config, "spread_method", "marker") == "levelset":
-        # ---- Level set solver (JAX) ----
+    """Simulate one ignition using its configured numerical method."""
+    if not (param_grid.x_min <= ignition.x <= param_grid.x_max
+            and param_grid.y_min <= ignition.y <= param_grid.y_max):
+        logger.warning("Ignition (%s, %s) outside grid bounds", ignition.x, ignition.y)
+        return FireResult(ignition=ignition,
+                          history=FirePerimeterHistory(perimeters=[], times=[]))
+
+    sim = config.simulation
+    method = _get_spread_method(sim)
+    logger.info("Single fire: %s, dt=%.4f min", method, sim.dt)
+
+    if method == "level_set":
         from ignacio.levelset import simulate_fire_spread_levelset
-        ls = sim_config.level_set
         history = simulate_fire_spread_levelset(
             param_grid=param_grid,
-            x_ignition=ignition.x,
-            y_ignition=ignition.y,
-            dt=sim_config.dt,
-            initial_radius=sim_config.initial_radius,
-            store_every=sim_config.store_every,
-            min_ros=sim_config.min_ros,
+            x_ignition=float(ignition.x),
+            y_ignition=float(ignition.y),
+            dt=sim.dt,
+            initial_radius=sim.initial_radius,
+            store_every=sim.store_every,
+            max_steps=_max_steps(config),
+            min_ros=sim.min_ros,
             is_geographic=is_geographic,
             center_latitude=center_latitude,
-            cfl_factor=ls.cfl_factor,
-            reinit_interval=ls.reinit_interval,
-            reinit_iters=ls.reinit_iters,
-            narrow_band_width=ls.narrow_band_width,
+            **_levelset_kwargs(config),
         )
-        # Level set contours are topologically clean — no untangling needed
     else:
-        # ---- Marker method (legacy) ----
-        mm = sim_config.marker_method
-        # Resolve advection integrator: legacy flag overrides if set
-        if mm.use_rk4_advection is not None:
-            _integrator = "rk4" if mm.use_rk4_advection else "euler"
-        else:
-            _integrator = mm.advection_integrator or "euler"
-
-        # Convert resample_spacing from meters to coordinate units (degrees) if geographic
-        _resample_spacing = None
-        if mm.resample_spacing is not None and mm.resample_spacing > 0:
-            if is_geographic and center_latitude is not None:
-                import math
-                _meters_per_deg_lat = 111_320.0
-                _meters_per_deg_lon = 111_320.0 * math.cos(math.radians(center_latitude))
-                _avg_m_per_deg = math.sqrt(_meters_per_deg_lat * _meters_per_deg_lon)
-                _resample_spacing = mm.resample_spacing / _avg_m_per_deg
-            else:
-                _resample_spacing = mm.resample_spacing
-
         history = simulate_fire_spread(
             param_grid=param_grid,
-            x_ignition=ignition.x,
-            y_ignition=ignition.y,
-            dt=sim_config.dt,
-            n_vertices=sim_config.n_vertices,
-            initial_radius=sim_config.initial_radius,
-            store_every=sim_config.store_every,
-            use_markers=mm.enabled,
-            marker_epsilon=mm.epsilon,
-            min_ros=sim_config.min_ros,
+            x_ignition=float(ignition.x),
+            y_ignition=float(ignition.y),
+            dt=sim.dt,
+            n_vertices=sim.n_vertices,
+            initial_radius=sim.initial_radius,
+            store_every=sim.store_every,
+            max_steps=_max_steps(config),
+            min_ros=sim.min_ros,
             is_geographic=is_geographic,
             center_latitude=center_latitude,
-            advection_integrator=_integrator,
-            resample_spacing=_resample_spacing,
-            redistribute_every=mm.redistribute_every if mm.redistribute_markers else 0,
+            **_marker_kwargs(config, geographic=is_geographic,
+                             latitude=center_latitude),
         )
+        history.marker_epsilon = float(sim.marker_method.epsilon)
+        history.marker_method = sim.marker_method
+        if sim.marker_method.enabled and sim.marker_method.topology_mode != "outer_hull":
+            # Legacy cleanup is deliberately not used for exact polygons.
+            if getattr(history, "burned_geometries", None) is None:
+                eps = float(sim.marker_method.epsilon)
+                untangle_history_perimeters(history, eps=eps,
+                                            simplify_tol=(0.5 * eps if eps else None))
 
-        # -----------------------------------------------------------------
-        # Untangle / clean stored perimeters (post-processing)
-        # -----------------------------------------------------------------
-        if sim_config.marker_method.enabled:
-            eps = float(sim_config.marker_method.epsilon or 0.0)
-            simplify_tol = (0.5 * eps) if eps > 0 else None
-            try:
-                setattr(history, "marker_epsilon", eps)
-                setattr(history, "marker_method", sim_config.marker_method)
-            except Exception:
-                pass
-
-            try:
-                untangle_history_perimeters(history, eps=eps, simplify_tol=simplify_tol)
-            except Exception as e:
-                logger.debug(f"Perimeter untangling failed (continuing without): {e}")
-
-    # ---------------------------------------------------------------------
-    # Compute and attach per-timestep history stats (area/perimeter/ROS)
-    # ---------------------------------------------------------------------
-    # These stats are exported alongside the perimeter history to CSV.
-    try:
-        perims = getattr(history, "perimeters", None) or []
-        times = getattr(history, "times", None) or []
-        n = min(len(perims), len(times))
-
-        history_stats: list[dict[str, Any]] = []
-
-        # Helper to compute area/perimeter in meters (and ha) for both projected and geographic CRSs
-        def _area_perim_from_xy(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-            if x.size < 3 or y.size < 3:
-                return 0.0, 0.0
-
-            if is_geographic:
-                lat0 = float(center_latitude) if center_latitude is not None else float(np.nanmean(y))
-                lat_rad = np.radians(lat0)
-                meters_per_deg_lat = 111320.0
-                meters_per_deg_lon = 111320.0 * np.cos(lat_rad)
-
-                x_m = (x - float(np.nanmean(x))) * meters_per_deg_lon
-                y_m = (y - float(np.nanmean(y))) * meters_per_deg_lat
-
-                area_m2 = 0.5 * np.abs(np.sum(x_m * np.roll(y_m, -1) - np.roll(x_m, -1) * y_m))
-                dx = np.diff(np.append(x_m, x_m[0]))
-                dy = np.diff(np.append(y_m, y_m[0]))
-                perim_m = float(np.sum(np.hypot(dx, dy)))
-                return area_m2 / 10000.0, perim_m
-
-            # Projected
-            area_m2 = 0.5 * np.abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-            dx = np.diff(np.append(x, x[0]))
-            dy = np.diff(np.append(y, y[0]))
-            perim_m = float(np.sum(np.hypot(dx, dy)))
-            return area_m2 / 10000.0, perim_m
-
-        prev_area_ha = 0.0
-        dt_minutes = float(sim_config.dt)
-
-        for step in range(n):
-            perim = perims[step]
-            x_arr, y_arr = None, None
-
-            # Stored perimeters in this pipeline are typically (x_array, y_array)
-            if isinstance(perim, tuple) and len(perim) == 2:
-                x_arr = np.asarray(perim[0], dtype=float)
-                y_arr = np.asarray(perim[1], dtype=float)
-            else:
-                ring = _perim_to_ring(perim)
-                if ring:
-                    x_arr = np.asarray([p[0] for p in ring], dtype=float)
-                    y_arr = np.asarray([p[1] for p in ring], dtype=float)
-
-            if x_arr is None or y_arr is None or x_arr.size < 3:
-                history_stats.append({"area_ha": 0.0, "perim_m": 0.0, "darea_ha": 0.0, "ros_mean": 0.0, "ros_max": 0.0})
-                continue
-
-            area_ha, perim_m = _area_perim_from_xy(x_arr, y_arr)
-            darea_ha = max(0.0, area_ha - prev_area_ha)
-            prev_area_ha = area_ha
-
-            # Map stored time (minutes) -> parameter-grid timestep index
-            t_min = float(times[step])
-            t_idx = int(round(t_min / dt_minutes)) if dt_minutes > 0 else 0
-            t_idx = max(0, min(t_idx, int(param_grid.n_timesteps) - 1))
-
-            # Sample ROS along the perimeter vertices for this timestep
-            ros_mean = 0.0
-            ros_max = 0.0
-            try:
-                ros_s, _, _, _ = param_grid.sample_at(t_idx, x_arr, y_arr)
-                ros_s = np.asarray(ros_s, dtype=float)
-                ros_pos = ros_s[np.isfinite(ros_s) & (ros_s > 0)]
-                if ros_pos.size > 0:
-                    ros_mean = float(np.mean(ros_pos))
-                    ros_max = float(np.max(ros_pos))
-            except Exception:
-                pass
-
-            history_stats.append(
-                {
-                    "area_ha": float(area_ha),
-                    "perim_m": float(perim_m),
-                    "darea_ha": float(darea_ha),
-                    "ros_mean": float(ros_mean),
-                    "ros_max": float(ros_max),
-                }
-            )
-
-        setattr(history, "history_stats", history_stats)
-    except Exception as e:
-        logger.debug(f"Failed computing history stats (continuing without): {e}")
-    
-    # Compute final metrics
-    final_area_ha = 0.0
-    final_perimeter_m = 0.0
-    
-    if history.perimeters:
-        # Find the last perimeter with enough vertices for area calculation
-        x, y = np.array([]), np.array([])
-        for pi in reversed(range(len(history.perimeters))):
-            _x, _y = history.perimeters[pi]
-            if len(_x) > 2:
-                x, y = _x, _y
-                break
-        if len(x) > 2:
-            if is_geographic:
-                # Convert from degrees to meters for area/perimeter calculation
-                if center_latitude is None:
-                    center_latitude = np.mean(y)
-                lat_rad = np.radians(center_latitude)
-                meters_per_deg_lat = 111320.0
-                meters_per_deg_lon = 111320.0 * np.cos(lat_rad)
-                
-                # Convert coordinates to local meters
-                x_m = (x - np.mean(x)) * meters_per_deg_lon
-                y_m = (y - np.mean(y)) * meters_per_deg_lat
-                
-                # Area via shoelace formula (in m²)
-                area_m2 = 0.5 * np.abs(np.sum(x_m * np.roll(y_m, -1) - np.roll(x_m, -1) * y_m))
-                final_area_ha = area_m2 / 10000.0
-                
-                # Perimeter length (in m)
-                dx = np.diff(np.append(x_m, x_m[0]))
-                dy = np.diff(np.append(y_m, y_m[0]))
-                final_perimeter_m = float(np.sum(np.hypot(dx, dy)))
-            else:
-                # Projected coordinates - direct calculation
-                # Area via shoelace formula
-                area_m2 = 0.5 * np.abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-                final_area_ha = area_m2 / 10000.0
-                
-                # Perimeter length
-                dx = np.diff(np.append(x, x[0]))
-                dy = np.diff(np.append(y, y[0]))
-                final_perimeter_m = float(np.sum(np.hypot(dx, dy)))
-    
-    spread_duration = history.times[-1] if history.times else 0.0
-    
+    stats = _history_statistics(history, param_grid, config,
+                                is_geographic=is_geographic)
+    final = stats[-1] if stats else {"area_ha": 0.0, "perim_m": 0.0}
     return FireResult(
         ignition=ignition,
         history=history,
-        final_area_ha=final_area_ha,
-        final_perimeter_m=final_perimeter_m,
-        dur_min=spread_duration,
+        final_area_ha=float(final["area_ha"]),
+        final_perimeter_m=float(final["perim_m"]),
+        dur_min=float(history.times[-1]) if history.times else 0.0,
+        ignition_positions=[(float(ignition.x), float(ignition.y))],
     )
 
 
@@ -1567,182 +1611,104 @@ def simulate_merged_fire(
     param_grid: FireParameterGrid,
     config: IgnacioConfig,
 ) -> FireResult:
-    """Propagate two or more ignitions together in one fire simulation.
+    """Evolve multiple ignitions together with the selected numerical method.
 
-    Marker mode evolves separate Richards marker rings and resolves intersections
-    with polygon union inside ``simulate_fire_spread``.
-
-    Level-set mode initializes a *single* signed-distance field from all ignition
-    locations and uses ``simulate_fire_spread_levelset``. Topology changes arise
-    from the field evolution, without marker-style polygon union in the solver.
-
-    Both modes return the same FirePerimeterHistory multi-front representation;
-    each saved time contains one or more exterior rings. Geometry unions below
-    are used ONLY for output statistics, not for advancing the level-set field.
+    Marker fronts are coupled through spread.py topology reconstruction.
+    Level-set ignitions are passed together to a single phi evolution.
     """
     if len(ignitions) < 2:
-        raise ValueError("simulate_merged_fire requires two or more ignitions")
-
-    sim_config = config.simulation
-    method = str(getattr(sim_config, "spread_method", "marker")).strip().lower()
-    if method not in {"marker", "levelset"}:
-        raise ValueError(f"Unsupported multi-ignition spread method: {method!r}")
-
+        raise ValueError("simultaneous fire requires two or more ignitions")
+    method = _get_spread_method(config.simulation)
+    sim = config.simulation
     positions = [(float(p.x), float(p.y)) for p in ignitions]
-    if not np.isfinite(np.asarray(positions, dtype=float)).all():
-        raise ValueError("Ignition coordinates must be finite")
-    if len(set(positions)) != len(positions):
-        raise ValueError("Simultaneous ignition coordinates must be distinct")
-
-    radius = float(sim_config.initial_radius)
+    if not np.isfinite(np.asarray(positions)).all() or len(set(positions)) != len(positions):
+        raise ValueError("Ignition locations must be finite and distinct")
+    radius = float(sim.initial_radius)
     if not np.isfinite(radius) or radius <= 0:
-        raise ValueError("simulation.initial_radius must be positive and finite")
-
-    for i, (x, y) in enumerate(positions, start=1):
+        raise ValueError("Initial radius must be finite and positive")
+    for x, y in positions:
         if not (param_grid.x_min + radius < x < param_grid.x_max - radius
                 and param_grid.y_min + radius < y < param_grid.y_max - radius):
-            raise ValueError(
-                f"Ignition {i}: ({x:.3f}, {y:.3f}) must lie within the "
-                f"projected grid with at least {radius:g} m boundary clearance"
-            )
+            raise ValueError(f"Ignition ({x}, {y}) lacks {radius} m grid clearance")
 
-    if method == "marker":
-        mm = sim_config.marker_method
-        if not mm.enabled:
-            raise ValueError("Multi-front marker propagation requires marker_method.enabled=true")
-        if getattr(mm, "use_rk4_advection", None) is not None:
-            integrator = "rk4" if mm.use_rk4_advection else "euler"
-        else:
-            integrator = mm.advection_integrator or "euler"
-        spacing = getattr(mm, "resample_spacing", None)
-        if spacing is None or float(spacing) <= 0:
-            raise ValueError(
-                "For multiple ignitions using markers, set "
-                "simulation.marker_method.resample_spacing > 0 in metres"
-            )
-        logger.info(
-            "Simultaneous marker experiment: %d ignitions, spacing %.2f m, integrator %s",
-            len(positions), float(spacing), integrator,
-        )
+    logger.info("Combined %s run: %d ignitions, %d timesteps",
+                method, len(positions), _max_steps(config))
+    if method == "lagrangian":
+        if not sim.marker_method.enabled:
+            raise ValueError("Multiple marker ignitions require marker_method.enabled")
         history = simulate_fire_spread(
             param_grid=param_grid,
-            # Keep legacy coordinates for compatibility with an older caller;
-            # all ignition locations are passed explicitly below.
             x_ignition=positions[0][0],
             y_ignition=positions[0][1],
             ignition_points=positions,
-            dt=sim_config.dt,
-            n_vertices=sim_config.n_vertices,
+            dt=sim.dt,
+            n_vertices=sim.n_vertices,
             initial_radius=radius,
-            store_every=sim_config.store_every,
-            use_markers=True,
-            marker_epsilon=mm.epsilon,
-            min_ros=sim_config.min_ros,
+            store_every=sim.store_every,
+            max_steps=_max_steps(config),
+            min_ros=sim.min_ros,
             is_geographic=False,
-            advection_integrator=integrator,
-            resample_spacing=float(spacing),
-            insert_factor=getattr(mm, "insert_factor", 1.5),
-            delete_factor=getattr(mm, "delete_factor", 0.5),
-            smoothing_weight=getattr(mm, "smooth_weight", 0.0),
-            smoothing_iters=getattr(mm, "smooth_iters", 0),
-            redistribute_every=mm.redistribute_every if mm.redistribute_markers else 0,
-            max_substeps=getattr(mm, "max_substeps", 50),
-            max_move_fraction=getattr(mm, "max_move_fraction", 0.5),
+            **_marker_kwargs(config),
         )
-        history.marker_method = mm
-        history.marker_epsilon = float(mm.epsilon)
-        # Multi-marker topology is already resolved by the spread solver.
-        # Do NOT run legacy single-ring untangling on these saved fronts.
-
+        history.marker_epsilon = float(sim.marker_method.epsilon)
+        history.marker_method = sim.marker_method
     else:
         from ignacio.levelset import simulate_fire_spread_levelset
-
-        ls = sim_config.level_set
-        logger.info(
-            "Simultaneous level-set experiment: %d ignitions, dt=%.4f min, CFL=%.3f",
-            len(positions), float(sim_config.dt), float(ls.cfl_factor),
-        )
         history = simulate_fire_spread_levelset(
             param_grid=param_grid,
             x_ignition=positions[0][0],
             y_ignition=positions[0][1],
             ignition_points=positions,
-            dt=sim_config.dt,
+            dt=sim.dt,
             initial_radius=radius,
-            store_every=sim_config.store_every,
-            min_ros=sim_config.min_ros,
+            store_every=sim.store_every,
+            max_steps=_max_steps(config),
+            min_ros=sim.min_ros,
             is_geographic=False,
-            cfl_factor=ls.cfl_factor,
-            reinit_interval=ls.reinit_interval,
-            reinit_iters=ls.reinit_iters,
-            narrow_band_width=ls.narrow_band_width,
+            **_levelset_kwargs(config),
         )
-        # No Shapely union or marker smoothing is applied to the evolving phi.
-        # The solver extracts all phi=0 exterior fronts into fronts_by_time.
 
-    if getattr(history, "fronts_by_time", None) is None:
-        raise RuntimeError(
-            f"The installed {method} solver returned a single-front history. "
-            "Check that the revised ignacio/spread.py and ignacio/levelset.py "
-            "are installed and provide multi-front support."
-        )
-    if not history.times or len(history.times) != len(history.fronts_by_time):
-        raise RuntimeError("Multi-front history has no snapshots or misaligned timestamps")
-    # Expect a distinct initial contour for each well-separated ignition.
-    # A small grid-resolution allowance avoids misclassifying barely touching
-    # circles that can connect under contour discretization.
+    times = getattr(history, "times", None) or []
+    if not times:
+        raise RuntimeError(f"{method} solver returned no snapshots")
+    if getattr(history, "fronts_by_time", None) is not None:
+        if len(history.fronts_by_time) != len(times):
+            raise RuntimeError("Fronts and time histories are misaligned")
+    if getattr(history, "burned_geometries", None) is not None:
+        if len(history.burned_geometries) != len(times):
+            raise RuntimeError("Burned geometries and time histories are misaligned")
+
+    # A multi-ignition model must not silently return one empty/single ignition.
+    init_geom = _history_geometry(history, 0)
+    if init_geom is None:
+        raise RuntimeError("No initial burned geometry from multi-ignition solver")
     grid_resolution = max(abs(float(param_grid.dx)), abs(float(param_grid.dy)))
-    if len(history.get_fronts(0)) != len(positions) and all(
-        np.hypot(positions[i][0] - positions[j][0],
-                 positions[i][1] - positions[j][1]) > 2 * radius + 2 * grid_resolution
-        for i in range(len(positions)) for j in range(i + 1, len(positions))
-    ):
+    separated = all(np.hypot(positions[i][0] - positions[j][0],
+                             positions[i][1] - positions[j][1]) >
+                    2 * radius + 2 * grid_resolution
+                    for i in range(len(positions)) for j in range(i + 1, len(positions)))
+    if separated and len(_polygon_parts(init_geom)) != len(positions):
         raise RuntimeError(
-            f"Expected {len(positions)} initially separate fronts but found "
-            f"{len(history.get_fronts(0))}. Check ignition and contour initialization."
+            f"Expected {len(positions)} initial disconnected burned regions, "
+            f"found {len(_polygon_parts(init_geom))}. "
+            "Check level-set multi-seed initialization and contour extraction."
         )
 
-    # Compute statistics from ALL exterior rings at each saved time, avoiding
-    # the invalid assumption that a disconnected fire is one closed ring.
-    stats = []
-    previous_area = 0.0
-    for i, t in enumerate(history.times):
-        geometry = _multi_geometry(history, i)
-        area_ha = float(geometry.area) / 10000.0 if geometry is not None else 0.0
-        perimeter_m = float(geometry.length) if geometry is not None else 0.0
-        fronts = _history_fronts(history, i)
-        ros_values = []
-        t_idx = max(0, min(
-            int(round(float(t) / float(sim_config.dt))), param_grid.nt - 1,
-        ))
-        for x, y in fronts:
-            ros, _, _, _ = param_grid.sample_at(t_idx, x, y)
-            ros = np.asarray(ros)
-            ros_values.extend(ros[np.isfinite(ros) & (ros > 0)].tolist())
-        stats.append({
-            "area_ha": area_ha,
-            "perim_m": perimeter_m,
-            "darea_ha": max(0.0, area_ha - previous_area),
-            "ros_mean": float(np.mean(ros_values)) if ros_values else 0.0,
-            "ros_max": float(np.max(ros_values)) if ros_values else 0.0,
-            "n_fronts": len(fronts),
-        })
-        previous_area = area_ha
-
-    history.history_stats = stats
+    stats = _history_statistics(history, param_grid, config)
     final = stats[-1]
     logger.info(
-        "%s combined fire: %d ignitions, %d snapshots, area %.4f ha, "
-        "boundary %.2f m, %d merger event(s), %d topology repair(s)",
-        method, len(positions), len(history.times), final["area_ha"],
-        final["perim_m"], len(history.merger_events), len(history.topology_repairs),
+        "%s: %d ignitions, %d snapshots, %.4f ha, %.2f m perimeter, "
+        "%d mergers, %d topology repairs",
+        method, len(positions), len(times), final["area_ha"], final["perim_m"],
+        len(getattr(history, "merger_events", []) or []),
+        len(getattr(history, "topology_repairs", []) or []),
     )
     return FireResult(
         ignition=ignitions[0],
         history=history,
         final_area_ha=float(final["area_ha"]),
         final_perimeter_m=float(final["perim_m"]),
-        dur_min=float(history.times[-1]),
+        dur_min=float(times[-1]),
         ignition_positions=positions,
     )
 
@@ -1867,11 +1833,11 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
     # Preserve every feature from a multi-point ignition shapefile BEFORE
     # saving the ignition layer. One run must evolve ALL fronts simultaneously
     # regardless of whether the selected solver is marker or levelset.
-    simultaneous_points = _file_ignition_positions(config, terrain)
+    simultaneous_points = (_file_ignition_positions(config, terrain)
+                           if config.simulation.simultaneous_ignitions else None)
     if simultaneous_points:
-        method = str(getattr(config.simulation, "spread_method", "marker")).strip().lower()
-        if method not in {"marker", "levelset"}:
-            raise ValueError(f"Unsupported multi-ignition spread method: {method!r}")
+        method = _get_spread_method(config.simulation)
+        _check_metric_grid(terrain)
         logger.info("Using %d simultaneous ignition points with %s solver",
                     len(simultaneous_points), method)
     ignitions = generate_ignitions(config, fuel_raster, rng, terrain_crs=terrain_crs)
@@ -1887,10 +1853,11 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
     logger.info("Step 4: Building parameter grid")
     logger.info("=" * 60)
     param_grid = build_parameter_grid(
-        config, 
-        terrain, 
+        config,
+        terrain,
         weather,
         hourly_data=hourly_data,
+        rng=rng,
     )
     
     # Step 5: Run simulations
@@ -1939,61 +1906,44 @@ def run_simulation(config: IgnacioConfig) -> SimulationResults:
     )
     fuel_grid = fuel_raster.data
 
-    if simultaneous_points:
-        if len(ignitions.points) != len(simultaneous_points):
-            raise ValueError("The ignition loader dropped one or more ignition points")
-        fire_result = simulate_merged_fire(list(ignitions.points), param_grid, config)
-        results.fires.append(fire_result)
-        logger.info("Combined fire: %d ignitions, area %.4f ha, boundary %.1f m, "
-                    "%d merger events, %d topology repairs",
-                    len(simultaneous_points), fire_result.final_area_ha,
-                    fire_result.final_perimeter_m,
-                    len(fire_result.history.merger_events),
-                    len(fire_result.history.topology_repairs))
+    if simultaneous_points and len(ignitions.points) != len(simultaneous_points):
+        raise ValueError("Ignition loader dropped one or more explicit points")
+
+    if config.simulation.simultaneous_ignitions:
+        _check_metric_grid(terrain)
+        groups: dict[int, list[IgnitionPoint]] = {}
+        for point in ignitions.points:
+            iteration = int(getattr(point, "iteration", 0) or 0)
+            groups.setdefault(iteration, []).append(point)
+        for iteration, members in sorted(groups.items()):
+            logger.info("Iteration %s: advancing %d ignition(s) as one system",
+                        iteration, len(members))
+            if len(members) == 1:
+                fire_result = simulate_single_fire(
+                    members[0], param_grid, config,
+                    is_geographic=is_geographic,
+                    center_latitude=center_latitude,
+                )
+            else:
+                fire_result = simulate_merged_fire(members, param_grid, config)
+            results.fires.append(fire_result)
     else:
+        # Preserve original independent-fire behavior.
         for i, ignition in enumerate(ignitions.points):
-            logger.info(f"Fire {i+1}/{n_ignitions}: ({ignition.x:.6f}, {ignition.y:.6f})")
-        
-            # Diagnostic: what's the fuel and ROS at ignition location?
-            try:
-                ros_arr, _, _, _ = param_grid.sample_at(0, np.array([ignition.x]), np.array([ignition.y]))
-                ros_at_ign = ros_arr[0]
-            
-                # Get grid indices for fuel lookup
-                x_frac = (ignition.x - param_grid.x_min) / (param_grid.x_max - param_grid.x_min)
-                x_idx = int(x_frac * (len(param_grid.x_coords) - 1))
-                x_idx = max(0, min(x_idx, fuel_grid.shape[1] - 1))
-            
-                if param_grid.y_flipped:
-                    y_frac = (param_grid.y_max - ignition.y) / (param_grid.y_max - param_grid.y_min)
-                else:
-                    y_frac = (ignition.y - param_grid.y_min) / (param_grid.y_max - param_grid.y_min)
-            
-                y_idx = int(y_frac * (len(param_grid.y_coords) - 1))
-                y_idx = max(0, min(y_idx, fuel_grid.shape[0] - 1))
-            
-                fuel_at_ign = fuel_grid[y_idx, x_idx]
-                fuel_name = config.fuel.fuel_lookup.get(int(fuel_at_ign), f"Unknown ({fuel_at_ign})")
-                logger.info(f"  Fuel: {fuel_name}, ROS: {ros_at_ign:.2f} m/min")
-            
-                if ros_at_ign < 0.01:
-                    logger.warning(f"  ROS at ignition is very low! Fire may not spread.")
-            except Exception as e:
-                logger.warning(f"  Could not get ignition diagnostics: {e}")
-        
+            logger.info("Fire %d/%d: (%.6f, %.6f)",
+                        i + 1, n_ignitions, ignition.x, ignition.y)
             fire_result = simulate_single_fire(
                 ignition, param_grid, config,
                 is_geographic=is_geographic,
                 center_latitude=center_latitude,
             )
             results.fires.append(fire_result)
-        
-            if fire_result.final_area_ha > 0:
-                logger.info(
-                    f"  - Area: {fire_result.final_area_ha:.2f} ha, "
-                    f"Perimeter: {fire_result.final_perimeter_m:.0f} m"
-                )
-    
+
+    # Save result metadata and histories, including all disjoint components.
+
+    # Step 6: Save outputs
+
+
     # Step 6: Save outputs
     logger.info("=" * 60)
     logger.info("Step 6: Saving outputs")
@@ -2025,162 +1975,42 @@ def perimeter_history_to_gdf(
     source_crs: str | None = None,
     start_datetime: str | None = None,
 ) -> gpd.GeoDataFrame:
-    """Convert a single FireResult history into a GeoDataFrame.
-
-    Produces one row per stored perimeter, with time metadata so the
-    progression can be plotted/animated.
-
-    Notes
-    -----
-    - `fire.history.times` is assumed to be minutes since ignition/start.
-    - Use GeoPackage (GPKG) if you want robust datetime storage.
-    """
-    # In a multi-front run each time can have 2+ exterior rings. Emit one row
-    # for each ring. All metadata remains in the projected CRS until GeoPandas
-    # performs the requested reprojection for storage.
-    if getattr(fire.history, "fronts_by_time", None) is not None:
-        start_ts = pd.Timestamp(start_datetime) if start_datetime else None
-        rows = []
-        stats = getattr(fire.history, "history_stats", [])
-        for step, t_min in enumerate(fire.history.times):
-            fronts = _history_fronts(fire.history, step)
-            st = stats[step] if step < len(stats) else {}
-            for front_id, (x, y) in enumerate(fronts):
-                poly = _front_polygon(x, y)
-                when = (start_ts + pd.Timedelta(minutes=float(t_min))) if start_ts is not None else None
-                rows.append({
-                    "fire_index": int(fire_index),
-                    "front_id": int(front_id),
-                    "n_fronts": int(len(fronts)),
-                    "n_ignitions": int(len(fire.ignition_positions or [])),
-                    "step": int(step),
-                    "t_min": float(t_min),
-                    "cause": fire.ignition.cause,
-                    "season": fire.ignition.season,
-                    "iteration": int(fire.ignition.iteration),
-                    "datetime": when.to_pydatetime() if when is not None else None,
-                    "area_ha": float(poly.area / 10000.0),
-                    "perim_m": float(poly.length),
-                    "total_area_ha": float(st.get("area_ha", np.nan)),
-                    "total_perim_m": float(st.get("perim_m", np.nan)),
-                    "darea_ha": float(st.get("darea_ha", np.nan)),
-                    "ros_mean": float(st.get("ros_mean", np.nan)),
-                    "ros_max": float(st.get("ros_max", np.nan)),
-                    "geometry": poly,
-                })
-        if not rows:
-            return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
-        gdf = gpd.GeoDataFrame(rows, geometry="geometry",
-                               crs=source_crs if source_crs else output_crs)
-        if source_crs and source_crs != output_crs:
-            gdf = gdf.to_crs(output_crs)
-        return gdf
-
-    perims = getattr(fire.history, "perimeters", None) or []
-    times = getattr(fire.history, "times", None) or []
-
-    n = min(len(perims), len(times))
-    if n <= 0:
-        return gpd.GeoDataFrame({"geometry": []}, crs=output_crs)
-
-    # Optional absolute datetime column
-    start_ts = pd.Timestamp(start_datetime) if start_datetime else None
-
-    rows: list[dict[str, Any]] = []
-    for step in range(n):
-        perim = perims[step]
-        ring = _perim_to_ring(perim)
-        if not ring or len(ring) < 4:
+    """One full hole-aware Polygon/MultiPolygon per stored simulation time."""
+    when0 = pd.Timestamp(start_datetime) if start_datetime else None
+    records = []
+    stats = getattr(fire.history, "history_stats", []) or []
+    for i, time_min in enumerate(fire.history.times):
+        geom = _history_geometry(fire.history, i)
+        if geom is None or geom.is_empty:
             continue
-
-        ring = _ensure_ring_closed(list(ring), eps=0.0)
-
-        # Level set contours are topologically clean — skip cleaning/smoothing
-        _is_level_set = (fire.history is not None
-                         and not hasattr(fire.history, "marker_method")
-                         and not hasattr(fire.history, "marker_epsilon"))
-
-        if _is_level_set:
-            poly = Polygon(ring)
-            if not poly.is_valid:
-                poly = poly.buffer(0)
-                if isinstance(poly, MultiPolygon):
-                    poly = max(poly.geoms, key=lambda g: g.area)
-        else:
-            # Clean/repair polygon using same utilities as final-perimeter export
-            eps = 0.0
-            try:
-                if fire.history is not None and hasattr(fire.history, "marker_epsilon"):
-                    eps = float(getattr(fire.history, "marker_epsilon") or 0.0)
-            except Exception:
-                eps = 0.0
-
-            simplify_tol = (0.5 * eps) if eps and eps > 0 else None
-
-            poly = _clean_polygon_from_ring(
-                ring,
-                eps=eps,
-                simplify_tol=simplify_tol,
-                resample_spacing=(
-                    float(getattr(getattr(fire.history, "marker_method", None), "resample_spacing", 0.0) or 0.0)
-                    if hasattr(fire.history, "marker_method")
-                    else (eps if eps and eps > 0 else None)
-                ),
-                chaikin_iters=(
-                    int(getattr(getattr(fire.history, "marker_method", None), "chaikin_iters", 0) or 0)
-                    if hasattr(fire.history, "marker_method")
-                    else 1
-                ),
-            )
-            if poly is None:
-                poly = Polygon(ring)
-
-        if poly.is_empty or poly.area <= 0:
-            continue
-
-        # Optional per-timestep stats computed during simulation
-        area_ha = None
-        perim_m = None
-        darea_ha = None
-        ros_mean = None
-        ros_max = None
-        try:
-            stats_list = getattr(fire.history, "history_stats", None)
-            if isinstance(stats_list, list) and step < len(stats_list):
-                st = stats_list[step] or {}
-                area_ha = st.get("area_ha")
-                perim_m = st.get("perim_m")
-                darea_ha = st.get("darea_ha")
-                ros_mean = st.get("ros_mean")
-                ros_max = st.get("ros_max")
-        except Exception:
-            pass
-
-        t_min = float(times[step])
-        dt_abs = (start_ts + pd.Timedelta(minutes=t_min)) if start_ts is not None else None
-
-        rows.append(
-            {
-                "fire_index": int(fire_index),
-                "step": int(step),
-                "t_min": t_min,
-                "cause": fire.ignition.cause,
-                "season": fire.ignition.season,
-                "iteration": int(fire.ignition.iteration),
-                "datetime": dt_abs.to_pydatetime() if dt_abs is not None else None,
-                "area_ha": float(area_ha) if area_ha is not None else None,
-                "perim_m": float(perim_m) if perim_m is not None else None,
-                "darea_ha": float(darea_ha) if darea_ha is not None else None,
-                "ros_mean": float(ros_mean) if ros_mean is not None else None,
-                "ros_max": float(ros_max) if ros_max is not None else None,
-                "geometry": poly,
-            }
-        )
-
-    gdf = gpd.GeoDataFrame(rows, crs=source_crs if source_crs else output_crs)
-    if source_crs and source_crs != output_crs and len(gdf) > 0:
+        row_stats = stats[i] if i < len(stats) else {}
+        parts = _polygon_parts(geom)
+        t_min = float(time_min)
+        when = when0 + pd.Timedelta(minutes=t_min) if when0 is not None else None
+        records.append({
+            "fire_index": int(fire_index),
+            "n_ignitions": len(fire.ignition_positions or []) or 1,
+            "step": int(i),
+            "t_min": t_min,
+            "datetime": when.to_pydatetime() if when is not None else None,
+            "cause": fire.ignition.cause,
+            "season": fire.ignition.season,
+            "iteration": int(getattr(fire.ignition, "iteration", 0) or 0),
+            "area_ha": float(geom.area) / 10000.0,
+            "perim_m": float(geom.length),
+            "darea_ha": float(row_stats.get("darea_ha", np.nan)),
+            "ros_mean": float(row_stats.get("ros_mean", np.nan)),
+            "ros_max": float(row_stats.get("ros_max", np.nan)),
+            "n_fronts": len(parts),
+            "n_holes": sum(len(p.interiors) for p in parts),
+            "n_active_fronts": len(_history_fronts(fire.history, i)),
+            "n_active_holes": len(_history_holes(fire.history, i)),
+            "exact_geom": getattr(fire.history, "burned_geometries", None) is not None,
+            "geometry": geom,
+        })
+    gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=source_crs or output_crs)
+    if source_crs and source_crs != output_crs and not gdf.empty:
         gdf = gdf.to_crs(output_crs)
-
     return gdf
 
 
@@ -2189,113 +2019,155 @@ def _save_results(
     output_dir: Path,
     config: IgnacioConfig,
 ) -> None:
-    """Save simulation results to files."""
-    # Get source CRS from terrain
-    source_crs = None
-    if results.terrain and results.terrain.crs:
-        source_crs = str(results.terrain.crs)
-    
-    # Save individual perimeters
+    """Export final perimeters, complete histories and active front boundaries."""
+    source_crs = (
+        str(results.terrain.crs)
+        if results.terrain is not None and results.terrain.crs is not None
+        else None
+    )
+    output_crs = config.crs.output_crs
+    output_dir.mkdir(parents=True, exist_ok=True)
     perimeters_dir = output_dir / "perimeters"
-    perimeters_dir.mkdir(exist_ok=True)
-    
-    for i, fire in enumerate(results.fires):
-        if fire.final_area_ha > 0:
-            gdf = fire.get_final_polygon(config.crs.output_crs, source_crs=source_crs)
-            
-            # Determine format
-            fmt = config.output.perimeter_format
-            if fmt == "shapefile":
-                path = perimeters_dir / f"fire_{i:04d}.shp"
-                driver = "ESRI Shapefile"
-            elif fmt == "geojson":
-                path = perimeters_dir / f"fire_{i:04d}.geojson"
-                driver = "GeoJSON"
-            else:
-                path = perimeters_dir / f"fire_{i:04d}.gpkg"
-                driver = "GPKG"
-            
-            write_vector(gdf, path, driver=driver)
-    
-    # Save combined perimeters
-    if config.output.combine_perimeters:
-        all_perimeters = results.get_all_perimeters(source_crs=source_crs)
-        if len(all_perimeters) > 0:
-            fmt = config.output.perimeter_format
-            if fmt == "shapefile":
-                combined_path = output_dir / "all_perimeters.shp"
-            elif fmt == "geojson":
-                combined_path = output_dir / "all_perimeters.geojson"
-            else:
-                combined_path = output_dir / "all_perimeters.gpkg"
-            
-            write_vector(all_perimeters, combined_path)
-            logger.info(f"Saved combined perimeters to {combined_path}")
+    perimeters_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save combined perimeter HISTORY (all fires, all stored timesteps)
-    # This enables plotting/animation of fire progression over time.
-    # NOTE: Shapefile has strict field limitations; prefer GPKG.
-    history_frames: list[gpd.GeoDataFrame] = []
     for i, fire in enumerate(results.fires):
-        # Include fires even if the final area is small, as long as there is history
-        if not getattr(fire.history, "perimeters", None) or not getattr(fire.history, "times", None):
+        if fire.final_area_ha <= 0:
             continue
+        gdf = fire.get_final_polygon(output_crs, source_crs=source_crs)
+        if gdf.empty:
+            continue
+        fmt = config.output.perimeter_format
+        suffix, driver = {
+            "shapefile": (".shp", "ESRI Shapefile"),
+            "geojson": (".geojson", "GeoJSON"),
+            "geopackage": (".gpkg", "GPKG"),
+        }[fmt]
+        write_vector(gdf, perimeters_dir / f"fire_{i:04d}{suffix}", driver=driver)
 
-        gdf_h = perimeter_history_to_gdf(
-            fire,
-            fire_index=i,
-            output_crs=config.crs.output_crs,
-            source_crs=source_crs,
-            start_datetime=getattr(config.simulation, "start_datetime", None),
+    if config.output.combine_perimeters:
+        all_fires = results.get_all_perimeters(source_crs=source_crs)
+        if not all_fires.empty:
+            fmt = config.output.perimeter_format
+            suffix, driver = {
+                "shapefile": (".shp", "ESRI Shapefile"),
+                "geojson": (".geojson", "GeoJSON"),
+                "geopackage": (".gpkg", "GPKG"),
+            }[fmt]
+            write_vector(all_fires, output_dir / f"all_perimeters{suffix}", driver=driver)
+
+    all_frames = []
+    exterior_records, interior_records = [], []
+    active_exterior_records, active_interior_records = [], []
+    event_records = []
+
+    for idx, fire in enumerate(results.fires):
+        history = fire.history
+        if not getattr(history, "times", None):
+            continue
+        frame = perimeter_history_to_gdf(
+            fire, idx, output_crs, source_crs,
+            start_datetime=config.simulation.start_datetime,
         )
-        if len(gdf_h) > 0:
-            history_frames.append(gdf_h)
+        if not frame.empty:
+            all_frames.append(frame)
 
-    if history_frames:
-        gdf_hist_all = gpd.GeoDataFrame(pd.concat(history_frames, ignore_index=True), crs=config.crs.output_crs)
+        for step, t_min in enumerate(history.times):
+            geom = _history_geometry(history, step)
+            if geom is None:
+                continue
+            # Solver-native propagating rings are distinct from static holes
+            # or geometric interfaces obtained from the burned polygon.
+            for role, native_rings, destination in (
+                ("active_exterior", _history_fronts(history, step), active_exterior_records),
+                ("active_interior", _history_holes(history, step), active_interior_records),
+            ):
+                for ring_idx, (x, y) in enumerate(native_rings):
+                    coords = np.column_stack((x, y))
+                    if len(coords) < 3:
+                        continue
+                    if not np.array_equal(coords[0], coords[-1]):
+                        coords = np.vstack((coords, coords[0]))
+                    destination.append({
+                        "fire_index": idx, "step": step, "t_min": float(t_min),
+                        "ring_id": ring_idx, "role": role,
+                        "geometry": LineString(coords),
+                    })
+            # Geometric boundaries include closed unburned islands, whether
+            # or not the solver exposes them as active marker rings.
+            for poly_idx, polygon in enumerate(_polygon_parts(geom)):
+                exterior_records.append({
+                    "fire_index": idx, "step": step, "t_min": float(t_min),
+                    "ring_id": poly_idx, "role": "exterior",
+                    "geometry": LineString(polygon.exterior.coords),
+                })
+                for hole_idx, inner in enumerate(polygon.interiors):
+                    interior_records.append({
+                        "fire_index": idx, "step": step, "t_min": float(t_min),
+                        "ring_id": hole_idx, "parent_id": poly_idx,
+                        "role": "interior", "geometry": LineString(inner.coords),
+                    })
 
-        # Force a robust container for time fields regardless of perimeter_format
-        hist_path = output_dir / "all_perimeters_history.gpkg"
-        write_vector(gdf_hist_all, hist_path, driver="GPKG")
-        logger.info(f"Saved combined perimeter history to {hist_path}")
+        stats = getattr(history, "history_stats", []) or []
+        if stats:
+            pd.DataFrame([
+                {"step": j, "t_min": float(history.times[j]), **st}
+                for j, st in enumerate(stats)
+            ]).to_csv(output_dir / f"fire_{idx:04d}_history_totals.csv", index=False)
+        for event_type, attr, name in (
+            ("merger", "merger_events", "merger_events"),
+            ("topology_repair", "topology_repairs", "topology_repairs"),
+        ):
+            events = getattr(history, attr, []) or []
+            if events:
+                pd.DataFrame(events).to_csv(
+                    output_dir / f"fire_{idx:04d}_{name}.csv", index=False
+                )
+            for event in events:
+                event_records.append({
+                    "fire_index": idx,
+                    "event_type": event_type,
+                    "detail_json": json.dumps(event, default=str),
+                    "time_min": event.get("time_min") if isinstance(event, dict) else None,
+                })
 
-        # Also save an attribute-only table for the history (no geometry).
-        # This is convenient when final perimeters are stored as Shapefiles.
-        hist_attr = gdf_hist_all.drop(columns=["geometry"], errors="ignore").copy()
-
-        # Make datetime CSV-friendly
-        if "datetime" in hist_attr.columns:
-            hist_attr["datetime"] = (
-                pd.to_datetime(hist_attr["datetime"], errors="coerce")
+    if all_frames:
+        history_gdf = gpd.GeoDataFrame(
+            pd.concat(all_frames, ignore_index=True),
+            geometry="geometry", crs=output_crs,
+        )
+        history_gdf.to_file(
+            output_dir / "all_perimeters_history.gpkg",
+            layer="burned_history", driver="GPKG",
+        )
+        attributes = history_gdf.drop(columns=["geometry"]).copy()
+        if "datetime" in attributes:
+            attributes["datetime"] = (
+                pd.to_datetime(attributes["datetime"], errors="coerce")
                 .dt.strftime("%Y-%m-%d %H:%M:%S")
             )
-
-        hist_attr_path = output_dir / "all_perimeters_history_attributes.csv"
-        hist_attr.to_csv(hist_attr_path, index=False)
-        logger.info(f"Saved perimeter history attribute table to {hist_attr_path}")
+        attributes.to_csv(
+            output_dir / "all_perimeters_history_attributes.csv", index=False
+        )
+        logger.info("Saved %d complete fire-history snapshots", len(history_gdf))
     else:
-        logger.info("No perimeter history to save (no stored perimeters/times found)")
-    
-    # Additional diagnostic tables for simultaneous ignition experiments.
-    for i, fire in enumerate(results.fires):
-        history = fire.history
-        if getattr(history, "fronts_by_time", None) is None:
-            continue
-        stats_rows = []
-        for step, t in enumerate(history.times):
-            st = dict(history.history_stats[step]) if step < len(history.history_stats) else {}
-            stats_rows.append({"step": step, "t_min": float(t), **st})
-        pd.DataFrame(stats_rows).to_csv(
-            output_dir / f"fire_{i:04d}_history_totals.csv", index=False)
-        if history.merger_events:
-            pd.DataFrame(history.merger_events).to_csv(
-                output_dir / f"fire_{i:04d}_merger_events.csv", index=False)
-        if history.topology_repairs:
-            pd.DataFrame(history.topology_repairs).to_csv(
-                output_dir / f"fire_{i:04d}_topology_repairs.csv", index=False)
+        logger.warning("No fire-history geometries available to export")
 
-    # Save summary CSV
-    summary = results.get_summary()
-    summary_path = output_dir / "simulation_summary.csv"
-    summary.to_csv(summary_path, index=False)
-    logger.info(f"Saved simulation summary to {summary_path}")
+    for filename, layer_name, rows in (
+        ("all_exterior_boundaries.gpkg", "exterior_boundaries", exterior_records),
+        ("all_interior_boundaries.gpkg", "interior_boundaries", interior_records),
+        ("all_active_exterior_fronts.gpkg", "active_exterior", active_exterior_records),
+        ("all_active_interior_fronts.gpkg", "active_interior", active_interior_records),
+    ):
+        if rows:
+            rings = gpd.GeoDataFrame(rows, geometry="geometry", crs=source_crs or output_crs)
+            if source_crs and source_crs != output_crs:
+                rings = rings.to_crs(output_crs)
+            rings.to_file(output_dir / filename, layer=layer_name, driver="GPKG")
+
+    if event_records:
+        pd.DataFrame(event_records).to_csv(
+            output_dir / "topology_events.csv", index=False
+        )
+
+    results.get_summary().to_csv(output_dir / "simulation_summary.csv", index=False)
+    logger.info("Saved complete H5 results to %s", output_dir)

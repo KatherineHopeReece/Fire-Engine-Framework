@@ -691,9 +691,14 @@ def extract_all_contours(
     phi_np: np.ndarray,
     x_coords: np.ndarray,
     y_coords: np.ndarray,
-) -> list[tuple[np.ndarray, np.ndarray]]:
+    return_holes: bool = False,
+):
     """
     Return all closed EXTERIOR phi=0 fronts in world coordinates.
+
+    With ``return_holes=True`` return ``(exteriors, holes)``: exteriors CCW
+    and unburned-island boundaries CW, matching the marker outer-hull
+    convention, so a hole-aware history can store both.
 
     The isocontours are interpolated with scikit-image. A near-boundary
     interior-side sample of ``phi`` distinguishes an exterior burned-area
@@ -728,7 +733,7 @@ def extract_all_contours(
     if not (
         np.min(field) < 0.0 < np.max(field)
     ):
-        return []
+        return ([], []) if return_holes else []
 
     d_min = min(
         abs(float(xs[1] - xs[0])),
@@ -736,7 +741,7 @@ def extract_all_contours(
     )
 
     exterior = []
-    holes = 0
+    hole_rings = []
 
     for rc in find_contours(field, 0.0):
 
@@ -834,11 +839,12 @@ def extract_all_contours(
         ):
             exterior.append((x, y))
         else:
-            holes += 1
+            # Unburned island: store clockwise (burned land on the left).
+            hole_rings.append((x[::-1].copy(), y[::-1].copy()))
 
-    if holes:
+    if hole_rings and not return_holes:
         raise NotImplementedError(
-            f"Level-set field has {holes} unburned interior hole contour(s). "
+            f"Level-set field has {len(hole_rings)} unburned interior hole contour(s). "
             "Exterior-only FirePerimeterHistory cannot represent interior "
             "boundaries without area errors; a hole-aware geometry export is required."
         )
@@ -859,7 +865,27 @@ def extract_all_contours(
         key=_area, reverse=True
     )
 
+    if return_holes:
+        hole_rings.sort(key=_area, reverse=True)
+        return exterior, hole_rings
     return exterior
+
+
+def _levelset_burned_geometry(exteriors, holes):
+    """Exact burned Polygon/MultiPolygon: exteriors minus unburned islands."""
+    import shapely
+    from shapely.geometry import Polygon
+
+    grid = 1e-6  # snap-rounded overlay, as in topology.py, for valid output
+    burned = shapely.union_all(
+        [Polygon(np.column_stack(r)).buffer(0) for r in exteriors],
+        grid_size=grid)
+    if holes:
+        islands = shapely.union_all(
+            [Polygon(np.column_stack(r)).buffer(0) for r in holes],
+            grid_size=grid)
+        burned = shapely.difference(burned, islands, grid_size=grid)
+    return burned
 
 
 # =============================================================================
@@ -1232,8 +1258,8 @@ def simulate_fire_spread_levelset(
     phi_np_out = np.asarray(phi)
 
     if multi_mode:
-        initial_fronts = extract_all_contours(
-            phi_np_out, x_coords, y_coords
+        initial_fronts, initial_holes = extract_all_contours(
+            phi_np_out, x_coords, y_coords, return_holes=True
         )
 
         if not initial_fronts:
@@ -1272,6 +1298,12 @@ def simulate_fire_spread_levelset(
                     (x.copy(), y.copy())
                     for x, y in initial_fronts
                 ]
+            ],
+            holes_by_time=[
+                [(x.copy(), y.copy()) for x, y in initial_holes]
+            ],
+            burned_geometries=[
+                _levelset_burned_geometry(initial_fronts, initial_holes)
             ],
         )
 
@@ -1892,10 +1924,11 @@ def simulate_fire_spread_levelset(
         if (step + 1) % store_every == 0:
 
             if multi_mode:
-                fronts = extract_all_contours(
+                fronts, holes = extract_all_contours(
                     np.asarray(phi),
                     x_coords,
                     y_coords,
+                    return_holes=True,
                 )
 
                 if not fronts:
@@ -1909,6 +1942,13 @@ def simulate_fire_spread_levelset(
                         (x.copy(), y.copy())
                         for x, y in fronts
                     ]
+                )
+
+                history.holes_by_time.append(
+                    [(x.copy(), y.copy()) for x, y in holes]
+                )
+                history.burned_geometries.append(
+                    _levelset_burned_geometry(fronts, holes)
                 )
 
                 history.perimeters.append(

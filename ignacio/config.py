@@ -150,10 +150,6 @@ class WeatherConfig(BaseModel):
     spread_event_lambda: float = Field(3.76, ge=0)
     calculate_fwi: bool = Field(True, description="Calculate FWI from hourly weather if not present")
     fwi_latitude: float | None = Field(None, description="Latitude for FWI calculation (uses DEM center if not set)")
-    additional_stations: list[dict] = Field(
-        default_factory=list,
-        description="Additional weather stations [{path, latitude, longitude}] for spatial interpolation"
-    )
 
 
 class FBPDefaultsConfig(BaseModel):
@@ -192,12 +188,7 @@ class FBPConfig(BaseModel):
     slope_factor: float = Field(0.5, ge=0, description="Slope effect strength")
     backing_fraction: float = Field(0.2, ge=0, le=1, description="BROS/ROS ratio")
     length_to_breadth: float = Field(2.0, gt=0, description="Fire shape L/B ratio")
-    ros_scale: float = Field(1.0, gt=0, description="Multiplier on all ROS components (ROS, BROS, FROS)")
     wind: WindConfig = Field(default_factory=WindConfig)
-    terrain_wind_deflection: float = Field(
-        0.0, ge=0, le=1,
-        description="Terrain wind deflection weight (0=none, 0.3=moderate valley channeling, 1=full)"
-    )
     elevation_adjustment: ElevationAdjustmentConfig = Field(
         default_factory=ElevationAdjustmentConfig
     )
@@ -207,6 +198,37 @@ class MarkerMethodConfig(BaseModel):
     """Marker method configuration."""
 
     enabled: bool = Field(True, description="Enable marker method")
+
+    # --- Multi-ignition topology reconstruction (opt-in) ---
+    # These settings are forwarded by simulation.py to simulate_fire_spread().
+    # Keeping the legacy mode as default preserves existing YAML behaviour.
+    topology_mode: Literal["legacy", "outer_hull"] = Field(
+        "legacy",
+        description=(
+            "Topology handling for multi-ignition marker runs. "
+            "'legacy' preserves the existing polygon-merger path; "
+            "'outer_hull' uses the oriented-linework reconstruction in topology.py."
+        ),
+    )
+    barrier_mode: Literal["off", "raise"] = Field(
+        "off",
+        description=(
+            "'raise' checks marker paths/perimeters against non-fuel geometry "
+            "and stops on a crossing; it does not resolve the collision."
+        ),
+    )
+    barrier_debug_dir: str = Field(
+        "marker_barrier_debug",
+        min_length=1,
+        description="Directory for barrier-violation diagnostic WKT/JSON files.",
+    )
+    export_burned_geometry: bool = Field(
+        False,
+        description=(
+            "Retain complete Polygon/MultiPolygon history, including holes. "
+            "Outer-hull mode also retains complete geometry for topology tracking."
+        ),
+    )
 
     # Geometry / resolution knobs
     epsilon: float = Field(1.0, gt=0, description="Marker epsilon (meters) used for activity + spacing heuristics")
@@ -229,7 +251,9 @@ class MarkerMethodConfig(BaseModel):
     # --- In-solver marker advection + redistribution knobs ---
     # These map to the Markersmethodchange block in spread.py. They are optional so existing configs work.
     # Markersmethodchange: integrator selection (preferred over the legacy boolean)
-    advection_integrator: Literal["euler", "heun", "rk4"] = Field(
+    advection_integrator: Literal[
+        "euler", "heun", "rk4", "euler_extrap", "implicit"
+    ] = Field(
         "rk4",
         description="Marker advection integrator to use during spread simulation.",
     )
@@ -245,8 +269,8 @@ class MarkerMethodConfig(BaseModel):
     )
     redistribute_every: int = Field(
         1,
-        ge=1,
-        description="Redistribution frequency in timesteps (1 = every step).",
+        ge=0,
+        description="Redistribution frequency in timesteps (0 disables; 1 = every step).",
     )
 
     # If provided, overrides epsilon as the target spacing for redistribution.
@@ -286,8 +310,11 @@ class MarkerMethodConfig(BaseModel):
     max_substeps: int = Field(
         10,
         ge=1,
-        le=100,
-        description="Maximum RK/Euler substeps per main timestep.",
+        le=10000,
+        description=(
+            "Maximum RK/Euler substeps per main timestep. "
+            "Multi-front runs raise if more are required."
+        ),
     )
     max_move_fraction: float = Field(
         0.5,
@@ -315,37 +342,191 @@ class MarkerMethodConfig(BaseModel):
         if self.insert_factor <= self.delete_factor:
             raise ValueError("marker_method.insert_factor must be > marker_method.delete_factor")
 
+        # New multi-ignition topology mode needs an explicit positive spacing
+        # and the same movement constraint enforced by spread.py. Retain
+        # legacy configuration behaviour outside this opt-in mode.
+        if self.topology_mode == "outer_hull":
+            if not self.enabled:
+                raise ValueError(
+                    "marker_method.enabled must be True when "
+                    "topology_mode='outer_hull'"
+                )
+            if self.resample_spacing is None:
+                self.resample_spacing = float(self.target_spacing)
+            if self.max_move_fraction > 1.0:
+                raise ValueError(
+                    "marker_method.max_move_fraction must be <= 1.0 "
+                    "for outer_hull topology"
+                )
+
         return self
 
 
-class LevelSetConfig(BaseModel):
-    """Level set solver configuration (JAX-based)."""
+class LevelSetMethodConfig(BaseModel):
+    """Level Set Method (Eulerian) configuration."""
 
-    cfl_factor: float = Field(0.5, gt=0, le=1.0, description="CFL safety factor for sub-stepping")
-    reinit_interval: int = Field(5, ge=0, description="Reinitialize φ every N outer steps")
-    reinit_iters: int = Field(10, ge=1, description="Pseudo-time iterations for reinitialization")
-    narrow_band_width: int | None = Field(None, ge=1, description="Optional narrow-band optimization (cells)")
+    # CFL / stability
+    cfl_factor: float = Field(
+        0.5,
+        gt=0,
+        le=1.0,
+        description="Fraction of CFL stability limit used for level-set substepping.",
+    )
+
+    # Reinitialization (signed-distance maintenance)
+    reinit_every: int = Field(
+        5,
+        ge=0,
+        description="Reinitialize signed-distance field every N outer steps (0 disables).",
+    )
+    reinit_iters: int = Field(
+        30,
+        ge=0,
+        le=500,
+        description="Pseudo-time iterations per reinitialization sweep.",
+    )
+
+    # Narrow banding
+    narrow_band: bool = Field(
+        True,
+        description="If True, update phi only within a band around the front.",
+    )
+    narrow_band_width: int = Field(
+        10,
+        ge=1,
+        le=10_000,
+        description="Half-width of narrow band in grid cells.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_reinit(self) -> "LevelSetMethodConfig":
+        if self.reinit_every == 0:
+            # If reinit disabled, ignore iters (but keep for user visibility)
+            return self
+        if self.reinit_every < 0:
+            raise ValueError("simulation.level_set.reinit_every must be >= 0")
+        return self
 
 
 class SimulationConfig(BaseModel):
     """Simulation parameters configuration."""
+
+    # Spread solver selector
+    # - "lagrangian": perimeter markers advected with Euler/RK4
+    # - "level_set": Eulerian level set method (phi field on grid)
+    method: Literal["lagrangian", "level_set"] = Field(
+        "lagrangian",
+        description="Fire spread solver: 'lagrangian' (markers) or 'level_set' (Eulerian LSM).",
+    )
+
+    # Backward compatibility with older IGNACIO YAML files and callers.
+    # Accepted legacy spellings are normalized in the pre-validation hook.
+    # After validation this field is always the legacy canonical spelling:
+    # 'marker' for lagrangian, 'levelset' for level_set.
+    spread_method: Literal[
+        "marker", "markers", "front", "lagrangian", "levelset", "level_set"
+    ] | None = Field(
+        None,
+        description=(
+            "Deprecated spread solver selector. Older configurations may use "
+            "'marker' or 'levelset'; prefer simulation.method."
+        ),
+    )
+
+    # When true, all ignitions in the same iteration are advanced as one
+    # fire system. Outer-hull reconstruction can merge exterior fronts and
+    # preserve interior holes. The level-set solver still requires its own
+    # multi-seed adapter in simulation.py / levelset.py.
+    simultaneous_ignitions: bool = Field(
+        False,
+        description=(
+            "Simulate ignition points belonging to the same iteration as "
+            "one evolving fire system, supporting front mergers and holes."
+        ),
+    )
 
     dt: float = Field(1.0, gt=0, description="Time step in minutes")
     max_duration: float = Field(1440, gt=0, description="Max duration in minutes")
     n_vertices: int = Field(300, ge=10, description="Fire perimeter vertices")
     initial_radius: float = Field(0.5, gt=0, description="Initial fire radius (m)")
     store_every: int = Field(10, ge=1, description="Storage frequency")
-    spread_method: Literal["marker", "levelset"] = Field("marker", description="Spread method: 'marker' or 'levelset'")
     marker_method: MarkerMethodConfig = Field(default_factory=MarkerMethodConfig)
-    level_set: LevelSetConfig = Field(default_factory=LevelSetConfig)
+    # Level-set (Eulerian) settings (used only when simulation.method == "level_set")
+    level_set: LevelSetMethodConfig = Field(default_factory=LevelSetMethodConfig)
     min_ros: float = Field(0.01, ge=0, description="Minimum ROS threshold")
     interpolation_resolution: float = Field(30.0, gt=0)
-    
+
     # Time-varying weather
     time_varying_weather: bool = Field(True, description="Enable time-varying weather")
     start_datetime: str | None = Field(None, description="Simulation start datetime (ISO format)")
     default_start_hour: int = Field(12, ge=0, le=23, description="Default start hour if not specified")
-    wind_direction_noise_std: float = Field(0.0, ge=0, description="Gaussian noise std (degrees) added to WD each timestep")
+
+    # Retained because older installed IGNACIO configurations exposed it.
+    # A nonzero value only affects spread if the consuming solver implements
+    # wind-direction perturbation; this field does not add that physics.
+    wind_direction_noise_std: float = Field(
+        0.0,
+        ge=0.0,
+        description="Standard deviation of wind-direction noise (degrees), if implemented by solver.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_solver_selector(cls, values: Any) -> Any:
+        """Support old and new solver names without silently changing methods.
+
+        The new ``method`` and old ``spread_method`` may be supplied alone.
+        If both appear they must designate the same solver.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        values = dict(values)
+        aliases = {
+            "marker": "lagrangian",
+            "markers": "lagrangian",
+            "front": "lagrangian",
+            "lagrangian": "lagrangian",
+            "levelset": "level_set",
+            "level_set": "level_set",
+        }
+        method_raw = values.get("method")
+        legacy_raw = values.get("spread_method")
+
+        if method_raw is not None:
+            key = str(method_raw).strip().lower()
+            if key not in aliases:
+                raise ValueError(f"Unsupported simulation.method: {method_raw!r}")
+            values["method"] = aliases[key]
+
+        if legacy_raw is not None:
+            key = str(legacy_raw).strip().lower()
+            if key not in aliases:
+                raise ValueError(
+                    f"Unsupported simulation.spread_method: {legacy_raw!r}"
+                )
+            normalized_legacy = aliases[key]
+            if method_raw is None:
+                values["method"] = normalized_legacy
+            elif values["method"] != normalized_legacy:
+                raise ValueError(
+                    "Conflicting solver selection: simulation.method="
+                    f"{method_raw!r} and simulation.spread_method={legacy_raw!r}"
+                )
+
+        return values
+
+    @model_validator(mode="after")
+    def _normalize_method_defaults(self) -> "SimulationConfig":
+        """Keep the modern and legacy solver selectors mutually consistent."""
+        if self.method == "lagrangian":
+            self.spread_method = "marker"
+        elif self.method == "level_set":
+            self.spread_method = "levelset"
+        else:
+            # The method Literal normally makes this branch unreachable.
+            raise ValueError("simulation.method must be 'lagrangian' or 'level_set'")
+        return self
 
 
 class OutputConfig(BaseModel):
@@ -407,32 +588,9 @@ class FuelBreakConfig(BaseModel):
         return self
 
 
-class CalibrationConfig(BaseModel):
-    """Calibration settings for parameter optimization."""
-
-    enabled: bool = Field(False, description="Run calibration instead of simulation")
-    observed_perimeter_path: str | None = Field(None, description="Path to observed fire perimeter (shapefile/GeoJSON)")
-    method: Literal["adam", "nelder-mead", "two-stage"] = Field("adam", description="Optimization method")
-    params: list[str] = Field(
-        default_factory=lambda: ["ros_scale"],
-        description="Parameters to calibrate: ros_scale, wind_direction_offset, backing_scale, flanking_scale",
-    )
-    n_iters: int = Field(30, ge=1, description="Maximum optimization iterations")
-    learning_rate: float = Field(0.01, gt=0, description="Adam learning rate")
-    max_steps: int | None = Field(None, ge=1, description="Max simulation steps (overrides max_duration/dt)")
-    resolution: float = Field(0.001, gt=0, description="Rasterization resolution for metrics (CRS units)")
-    w_jaccard: float = Field(1.0, ge=0, description="Weight for (1-Jaccard) loss")
-    w_size: float = Field(0.5, ge=0, description="Weight for centroid size ratio loss")
-    w_shape: float = Field(0.3, ge=0, description="Weight for Procrustes RMSE loss")
-    w_area: float = Field(0.5, ge=0, description="Weight for area mismatch loss (Adam only)")
-    w_perimeter: float = Field(1.0, ge=0, description="Weight for phi-perimeter loss (Adam only)")
-    filter_main_complex: bool = Field(False, description="Filter observed perimeter to main fire complex, dropping tiny fragments")
-    min_area_fraction: float = Field(0.01, ge=0, le=1, description="Min polygon area as fraction of largest (for filter_main_complex)")
-
-
 class IgnacioConfig(BaseModel):
     """Root configuration model for Ignacio."""
-
+    
     project: ProjectConfig
     crs: CRSConfig = Field(default_factory=CRSConfig)
     terrain: TerrainConfig
@@ -442,7 +600,6 @@ class IgnacioConfig(BaseModel):
     fbp: FBPConfig = Field(default_factory=FBPConfig)
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
-    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     # Backward-compatible single fuel break (deprecated; prefer `fuel_breaks`)
     fuel_break: FuelBreakConfig | None = Field(
         default=None,
